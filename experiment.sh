@@ -16,12 +16,17 @@ echo "My SLURM_ARRAY_JOB_ID: " $SLURM_ARRAY_JOB_ID
 # Add lines here to run your computations
 job_id=$SLURM_ARRAY_JOB_ID
 #module load libgmp
-module load python
+#module load python
+
+#source ~/miniconda3/etc/profile.d/conda.sh
+module load python/anaconda-2022.05
+conda activate cp_env
+module unload load python/anaconda-2022.05
 
 result_file="new_exp_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 echo "result file is ${result_file}"
 cd $SCRATCH/$USER/CP_LLM/
-Rscript experiments/experiment.py $result_file $SLURM_ARRAY_TASK_ID  $1 $2 $3 $4 $5
+python experiment.py --exp_name $result_file -seed $SLURM_ARRAY_TASK_ID  --n_train $1 --n_calib $2 --temp $3 --delta $4 --epsilon $5
 # $1 : n_train
 # $2 : n_calib
 # $3 : temp
