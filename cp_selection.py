@@ -5,9 +5,15 @@ from collections import Counter
 from scipy.sparse import csr_matrix
 from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.model_selection import GroupKFold
+from typing import List, Dict, Any, Tuple, Optional
+import numpy as np
+from collections import Counter
+from scipy.sparse import csr_matrix
+from sklearn.decomposition import LatentDirichletAllocation
+from sklearn.model_selection import KFold
 
 
-from conditionalconformal import ConditionalConformal as CondConf
+from conditionalconformal import CondConf
 from unit import Unit, assemble_feature_label_arrays_doclevel  # Assuming Unit is defined in a module named 'unit'
 
 # ------------------------------
@@ -70,53 +76,6 @@ def global_threshold_S_doclevel(units_by_doc: Dict[int, List[Unit]],
     s_sorted = np.sort(S_vals)
     return float(s_sorted[q_idx - 1])
 
-
-
-def _original_docs_from_units(units: List[Any]) -> Tuple[List[int], List[List[int]]]:
-    """Deduplicate by doc_idx; original = doc_ctx + masked_true."""
-    tokens_by_doc: Dict[int, List[int]] = {}
-    for u in units:
-        if u.doc_idx in tokens_by_doc:
-            continue
-        toks = []
-        for s in u.doc_ctx:      # unmasked sentences
-            toks.extend(s)
-        for s in u.masked_true:  # original masked sentences
-            toks.extend(s)
-        tokens_by_doc[u.doc_idx] = toks
-    doc_ids = sorted(tokens_by_doc.keys())
-    docs_tokens = [tokens_by_doc[i] for i in doc_ids]
-    return doc_ids, docs_tokens
-
-def _tokens_to_dtm(docs_tokens: List[List[int]], V: int) -> csr_matrix:
-    rows, cols, data = [], [], []
-    for i, toks in enumerate(docs_tokens):
-        cnt = Counter(toks)
-        if cnt:
-            ks, vs = zip(*cnt.items())
-            rows.extend([i] * len(ks))
-            cols.extend(ks)
-            data.extend(vs)
-    return csr_matrix((np.asarray(data, dtype=np.float32),
-                       (np.asarray(rows, dtype=np.int32),
-                        np.asarray(cols, dtype=np.int32))),
-                      shape=(len(docs_tokens), V), dtype=np.float32)
-
-def _interval(s_star, _x):
-    """Return interval [-inf, s*] as the library expects."""
-    return np.array([-np.inf, float(s_star)], dtype=np.float64)
-
-# ------------------------------------------------------------
-# Main: conditional thresholding on doc-level using LDA features
-# ------------------------------------------------------------
-from typing import List, Dict, Any, Tuple, Optional
-import numpy as np
-from collections import Counter
-from scipy.sparse import csr_matrix
-from sklearn.decomposition import LatentDirichletAllocation
-from sklearn.model_selection import KFold
-
-# ---------- helpers: originals, DTM, interval ----------
 
 def _original_docs_from_units(units: List[Any]) -> Tuple[List[int], List[List[int]]]:
     """Deduplicate by doc_idx; original = doc_ctx + masked_true."""

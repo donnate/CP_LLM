@@ -43,8 +43,8 @@ delta = args.delta
 epsilon = args.epsilon
 
 
-from config import SynthConfig, Document, Candidate, make_topics, generate_corpus, softmax_temp, dirichlet_sample, assemble_feature_label_arrays_doclevel
-from unit import BaseUnit, Unit, assemble_augmented_docs_and_units, gen_candidates_for_mask
+from config import SynthConfig, Document, Candidate, make_topics, generate_corpus, softmax_temp, dirichlet_sample
+from unit import BaseUnit, Unit, assemble_augmented_docs_and_units, gen_candidates_for_mask, build_units, assemble_feature_label_arrays_doclevel
 from helper_similarity_metrics import cosine_from_counts, cosine_from_freq, counts_vec, distinct_1, js_divergence
 from cp_selection import per_doc_S_doclevel, per_doc_S_doclevel_multi, global_threshold_S_doclevel, fit_conditional_threshold_doclevel
 from featurize_document import featurize_candidate_doclevel, compute_idf
@@ -534,35 +534,34 @@ def run_synthetic_experiment(cfg: SynthConfig,
         as_log=False)
 
 
-    r2 = np.corrcoef(reg.predict(X_calib), y_calib)[0, 1]
+    corr_calib_ahat = np.corrcoef(reg.predict(X_calib), y_calib)[0, 1]
 
-    #### Make nice plot
-    plt.figure(figsize=(10, 6))
-    plt.scatter(reg.predict(X_train), y_train, alpha=0.3, label='Train Predictions')
-    plt.scatter(reg.predict(X_calib), y_calib, alpha=0.3, label='Calib Predictions')
-    plt.xlabel('Predicted A_hat')
-    plt.ylabel('True A_obs')
-    plt.title('Predicted vs True A_obs: correlation on calib = {:.3f}'.format(r2))
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-
-    import matplotlib.pyplot as plt
-    ### Make nice plot
-    r2 = np.corrcoef(reg.predict(X_calib), y_calib_oracle)[0, 1]
-    plt.figure(figsize=(10, 6))
-    plt.scatter(reg.predict(X_train), y_train_oracle, alpha=0.3, label='Train Predictions')
-    plt.scatter(reg.predict(X_calib), y_calib_oracle, alpha=0.3, label='Calib Predictions')
-    plt.xlabel('Predicted A_hat')
-    plt.ylabel('Oracle A_star')
-    plt.title('Predicted vs Oracle A_star: correlation on calib = {:.3f}'.format(r2))
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    # #### Make nice plot
+    # plt.figure(figsize=(10, 6))
+    # plt.scatter(reg.predict(X_train), y_train, alpha=0.3, label='Train Predictions')
+    # plt.scatter(reg.predict(X_calib), y_calib, alpha=0.3, label='Calib Predictions')
+    # plt.xlabel('Predicted A_hat')
+    # plt.ylabel('True A_obs')
+    # plt.title('Predicted vs True A_obs: correlation on calib = {:.3f}'.format(r2))
+    # plt.legend()
+    # plt.grid(True)
+    # plt.show()
 
 
-    
+    # import matplotlib.pyplot as plt
+    # ### Make nice plot
+    corr_calib_oracle = np.corrcoef(reg.predict(X_calib), y_calib_oracle)[0, 1]
+    # plt.figure(figsize=(10, 6))
+    # plt.scatter(reg.predict(X_train), y_train_oracle, alpha=0.3, label='Train Predictions')
+    # plt.scatter(reg.predict(X_calib), y_calib_oracle, alpha=0.3, label='Calib Predictions')
+    # plt.xlabel('Predicted A_hat')
+    # plt.ylabel('Oracle A_star')
+    # plt.title('Predicted vs Oracle A_star: correlation on calib = {:.3f}'.format(r2))
+    # plt.legend()
+    # plt.grid(True)
+    # plt.show()
+
+
 
     predict_for_units_doclevel(train_units, reg, idf, phi, target="obs")  # <<< NEW
 
@@ -674,7 +673,7 @@ if __name__ == "__main__":
                             n_docs=n_train + n_calib + 500, S=10, L=12, mask_frac=0.5, Kgen=20,
                             delta=delta, epsilon=epsilon, T=temp,
                             lambda_obs=0.01, rho=10, alpha_cp=alpha_cp,
-                            n_train_docs=n_train, n_calib_docs=n_calib n_aug_docs=500,
+                            n_train_docs=n_train, n_calib_docs=n_calib, n_aug_docs=500,
                             seed=SEED
                         )
                         for lambda_obs in [0.05, 0.1, 0.25, 0.35]:
