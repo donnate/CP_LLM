@@ -686,7 +686,7 @@ if __name__ == "__main__":
                                 lda_results, downstream_metrics = evaluate_lda_and_downstream(cfg, res, seed=cfg.seed)
                                 row = results_to_row(cfg, res, lda_results, downstream_metrics)
                                 results_df = pd.concat([results_df, pd.DataFrame([row])], ignore_index=True)
-                                results_df.to_csv("synthetic_results_llm_cp_" +name_exp + ".csv", index=False)
+                                results_df.to_csv("results/synthetic_results_llm_cp_" +name_exp + ".csv", index=False)
 
                                 print(results_df.tail(1))  # last row just added
                                 print("Done")
