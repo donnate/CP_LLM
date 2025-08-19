@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import math, random
+import math, random, os
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Sequence
+from typing import List, Tuple, Dict, Any, Sequence, Optional
 from collections import Counter
 
 import numpy as np
@@ -20,6 +20,7 @@ from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.metrics import mean_squared_error, r2_score, roc_auc_score, accuracy_score
 
+import pandas as pd
 
 
 #### load arguments
@@ -43,12 +44,23 @@ delta = args.delta
 epsilon = args.epsilon
 
 
-from config import SynthConfig, Document, Candidate, make_topics, generate_corpus, softmax_temp, dirichlet_sample
-from unit import BaseUnit, Unit, assemble_augmented_docs_and_units, gen_candidates_for_mask, build_units, assemble_feature_label_arrays_doclevel
-from helper_similarity_metrics import cosine_from_counts, cosine_from_freq, counts_vec, distinct_1, js_divergence
-from cp_selection import per_doc_S_doclevel, per_doc_S_doclevel_multi, global_threshold_S_doclevel, fit_conditional_threshold_doclevel
+# ---- local modules you already split out ----
+from config import (
+    SynthConfig, Document, Candidate,
+    make_topics, generate_corpus, softmax_temp, dirichlet_sample
+)
+from unit import (
+    BaseUnit, Unit, assemble_augmented_docs_and_units, gen_candidates_for_mask,
+    build_units, assemble_feature_label_arrays_doclevel
+)
+from helper_similarity_metrics import (
+    cosine_from_counts, cosine_from_freq, counts_vec, distinct_1, js_divergence
+)
+from cp_selection import (
+    per_doc_S_doclevel, per_doc_S_doclevel_multi, global_threshold_S_doclevel,
+    fit_conditional_threshold_doclevel
+)
 from featurize_document import featurize_candidate_doclevel, compute_idf
-
 
 
 def set_seed(seed: int = 0):
@@ -56,15 +68,9 @@ def set_seed(seed: int = 0):
     np.random.seed(seed)
 
 
-
 # ------------------------------
 # Scores & features (doc-level)
 # ------------------------------
-    
-
-
-
-
 
 def predict_for_units_doclevel(units: List[Unit],
                                reg: Any,
@@ -84,9 +90,6 @@ def predict_for_units_doclevel(units: List[Unit],
     yhat = reg.predict(X).astype(np.float32)
     for u, yh in zip(units, yhat):
         u.A_hat = float(yh)
-
-
-
 
 
 # ------------------------------
@@ -132,8 +135,8 @@ def apply_filter_and_eval_doclevel(units_by_doc: Dict[int, List[Unit]],
     n_docs = len(units_by_doc)
     miscover_cnt = 0
     accepted_total = 0
-    all_accepted_tokens = []
-    jsd_vals = []
+    all_accepted_tokens: List[int] = []
+    jsd_vals: List[float] = []
 
     for _, units in units_by_doc.items():
         u = units[0]
@@ -189,10 +192,25 @@ def unit_to_aug_tokens(u: Unit) -> List[int]:
     for s in u.candidates: toks.extend(s)
     return toks
 
-def fit_lda_and_transform(X_train: csr_matrix,
-                          X_tr_for_features: csr_matrix,
-                          X_test: csr_matrix,
-                          K: int, alpha: float, beta: float, seed: int):
+
+# --- helpers for "full-corpus" LDA evaluation ---
+
+def original_tokens_for(docs, idxs=None):
+    if idxs is None:
+        idxs = range(len(docs))
+    return [flatten_doc(docs[i].sentences) for i in idxs]
+
+def units_to_aug_docs(units: List[Unit]) -> List[List[int]]:
+    # Each Unit is treated as its own doc for the augmented corpus
+    return [unit_to_aug_tokens(u) for u in units]
+
+def fit_lda_and_transform_many(X_train: csr_matrix,
+                               X_list_to_transform: List[csr_matrix],
+                               K: int, alpha: float, beta: float, seed: int):
+    """
+    Fit an LDA on X_train, then .transform() every matrix in X_list_to_transform.
+    Returns (lda, phi_hat, [W_0, W_1, ...]) where W_i = transform(X_list_to_transform[i]).
+    """
     lda = LatentDirichletAllocation(
         n_components=K,
         doc_topic_prior=alpha,
@@ -203,11 +221,10 @@ def fit_lda_and_transform(X_train: csr_matrix,
         evaluate_every=0,
     )
     _ = lda.fit_transform(X_train)
-    W_train = lda.transform(X_tr_for_features)
-    W_test  = lda.transform(X_test)
-    comp = lda.components_.astype(np.float64) + 1e-12  # (K,V)
-    phi_hat = comp / comp.sum(axis=1, keepdims=True)
-    return lda, phi_hat, W_train, W_test
+    comps = lda.components_.astype(np.float64) + 1e-12
+    phi_hat = comps / comps.sum(axis=1, keepdims=True)
+    W_list = [lda.transform(X) for X in X_list_to_transform]
+    return lda, phi_hat, W_list
 
 def align_topics(phi_true: np.ndarray, phi_hat: np.ndarray) -> Tuple[np.ndarray, float, float]:
     """Align phi_hat to phi_true via Hungarian on JSD; return (perm, mean_jsd, mean_cos)."""
@@ -228,213 +245,316 @@ def align_topics(phi_true: np.ndarray, phi_hat: np.ndarray) -> Tuple[np.ndarray,
     r, c = linear_sum_assignment(D)
     return c, float(D[r, c].mean()), float(C[r, c].mean())
 
+def _align_and_doc_theta_metrics(phi_true: np.ndarray,
+                                 phi_hat: np.ndarray,
+                                 W_docs: np.ndarray,  # shape (n_docs, K) from lda.transform
+                                 Theta_true: np.ndarray) -> Tuple[Dict[str, float], np.ndarray, np.ndarray]:
+    """
+    Align phi_hat to phi_true; reorder W_docs columns; compute topic + doc-theta metrics.
+    """
+    perm, mean_jsd, mean_cos = align_topics(phi_true, phi_hat)
+    phi_hat_aligned = phi_hat[perm]
+    W_aligned = W_docs[:, perm]
+    l1 = float(np.mean(np.linalg.norm(W_aligned - Theta_true, ord=1, axis=1)))
+    l2 = float(np.mean(np.linalg.norm(W_aligned - Theta_true, ord=2, axis=1)))
+    return {
+        "phi_mean_jsd": float(mean_jsd),
+        "phi_mean_cos": float(mean_cos),
+        "theta_l1_mean": l1,
+        "theta_l2_mean": l2,
+    }, phi_hat_aligned, W_aligned
+
+
+# ------------------------------
+# Selection metrics + optional full-corpus LDA comparison
+# ------------------------------
 
 def evaluate_selected_doclevel(selected_by_doc: Dict[int, List[Unit]],
                                doc_total_units: Dict[int, int],
                                phi: np.ndarray,
-                               phi_hat: np.ndarray,
                                lambda_obs: float,
-                               rho: int) -> Dict[str, float]:
+                               rho: int,
+                               *,
+                               full_corpus_lda: bool = False,
+                               docs: Optional[List[Document]] = None,
+                               splits: Optional[Dict[str, np.ndarray]] = None,
+                               extra_selected_units: Optional[List[Unit]] = None,
+                               seed: int = 0) -> Dict[str, Any]:
     """
-    Evaluate a selection produced by a filtering rule that returns selected (accepted)
-    augmented units per document.
+    (A) Original selection metrics (unchanged): miscoverage, accept_rate, diversity, doc-level drift.
+    (B) OPTIONAL (full_corpus_lda=True): re-fit LDA on the entire corpus and compare topic/theta recovery
+        - 'unaug_full' : LDA on original TRAIN+CALIB+TEST docs
+        - 'aug_full'   : LDA on (unaug_full + selected augmented docs)
 
-    Parameters
-    ----------
-    selected_by_doc : dict {doc_idx -> list of accepted Units for that doc}
-    doc_total_units : dict {doc_idx -> total #augmented units available for that doc}
-    phi : (K, V) topic-word matrix, used for drift proxy
-    lambda_obs : BAD/GOOD cutoff at doc-level
-    rho : allowed #bad accepts per doc
-
-    Returns
-    -------
-    dict with keys:
-      - miscoverage : fraction of docs with (#bad accepts > rho)
-      - accept_rate : (#accepted across all docs) / (total augmented across all docs)
-      - distinct_1  : distinct-1 over all accepted replacement tokens
-      - jsd_drift   : mean JSD(θ_true, θ_aug) proxy across accepted docs
+    Pass `extra_selected_units` to include accepted units from TRAIN/CALIB as well.
     """
+    # ---------- (A) selection metrics ----------
     n_docs = len(doc_total_units)
     if n_docs == 0:
-        return {"miscoverage": 0.0, "accept_rate": 0.0, "distinct_1": 0.0, "jsd_drift": 0.0}
+        base = {"miscoverage": 0.0, "accept_rate": 0.0, "distinct_1": 0.0,
+                "jsd_drift": 0.0, "l1_drift": 0.0, "l2_drift": 0.0,
+                "l1_drift_topic": 0.0, "l2_drift_topic": 0.0}
+    else:
+        miscover_cnt, accepted_total, total_units = 0, 0, 0
+        all_accepted_tokens: List[int] = []
+        jsd_vals: List[float] = []
+        l1_vals: List[float] = []
+        l2_vals: List[float] = []
 
-    miscover_cnt = 0
-    accepted_total = 0
-    total_units = 0
-    all_accepted_tokens: List[int] = []
-    jsd_vals: List[float] = []
-    l1_vals: List[float] = []
-    l2_vals: List[float] = []
+        for doc_idx, tot in doc_total_units.items():
+            accepted = selected_by_doc.get(doc_idx, [])
+            accepted_total += len(accepted)
+            total_units += int(tot)
+            bad_accepts = sum(1 for u in accepted if float(u.A_obs_doc) < float(lambda_obs))
+            if bad_accepts > rho:
+                miscover_cnt += 1
+            if accepted:
+                for u in accepted:
+                    for sent in u.candidates:
+                        all_accepted_tokens.extend(sent)
 
-    for doc_idx, tot in doc_total_units.items():
-        accepted = selected_by_doc.get(doc_idx, [])
-        accepted_total += len(accepted)
-        total_units    += int(tot)
+                u0 = accepted[0]
+                orig_theta = u0.doc_theta / (u0.doc_theta.sum() + 1e-20)
+                aug_tokens = [t for s in u0.doc_ctx for t in s]
+                for u in accepted:
+                    for s in u.candidates:
+                        aug_tokens.extend(s)
+                aug_theta = expected_theta_from_tokens(aug_tokens, phi, prior=orig_theta)
+                jsd_vals.append(js_divergence(orig_theta, aug_theta))
+                l2_vals.append(np.linalg.norm(orig_theta - aug_theta, ord=2))
+                l1_vals.append(np.linalg.norm(orig_theta - aug_theta, ord=1))
 
-        # miscoverage: too many bad accepts for this doc?
-        bad_accepts = sum(1 for u in accepted if float(u.A_obs_doc) < float(lambda_obs))
-        if bad_accepts > rho:
-            miscover_cnt += 1
+        base = {
+            "miscoverage": miscover_cnt / max(1, n_docs),
+            "accept_rate": accepted_total / max(1, total_units),
+            "distinct_1": distinct_1(all_accepted_tokens),
+            "jsd_drift": float(np.mean(jsd_vals)) if jsd_vals else 0.0,
+            "l1_drift": float(np.mean(l1_vals)) if l1_vals else 0.0,
+            "l2_drift": float(np.mean(l2_vals)) if l2_vals else 0.0,
+            "l1_drift_topic": 0.0,   # filled only when full_corpus_lda=True
+            "l2_drift_topic": 0.0,
+        }
 
-        # diversity + drift per doc (only if at least one accept)
-        if accepted:
-            # collect all accepted replacement tokens once per doc (avoid duplicating context)
-            for u in accepted:
-                for sent in u.candidates:
-                    all_accepted_tokens.extend(sent)
+    if not full_corpus_lda:
+        return base
 
-            # drift: compare θ_true vs a proxy θ_aug inferred from (doc_ctx + all accepted replacements)
-            u0 = accepted[0]
-            orig_theta = u0.doc_theta / (u0.doc_theta.sum() + 1e-20)
-            aug_tokens = [t for s in u0.doc_ctx for t in s]
-            for u in accepted:
-                for s in u.candidates:
-                    aug_tokens.extend(s)
-            aug_theta = expected_theta_from_tokens(aug_tokens, phi, prior=orig_theta)
-            jsd_vals.append(js_divergence(orig_theta, aug_theta))
-            ##### add l1 norm and l2 norm
-            l2_vals.append(np.linalg.norm(orig_theta - aug_theta, ord=2))
-            l1_vals.append(np.linalg.norm(orig_theta - aug_theta, ord=1))
+    # ---------- (B) re-fit LDA on FULL CORPUS (with/without augmentation) ----------
+    assert docs is not None and splits is not None, \
+        "When full_corpus_lda=True, pass docs= and splits={'idx_train','idx_calib','idx_aug'}."
+
+    V = phi.shape[1]
+    idx_all = np.r_[splits["idx_train"], splits["idx_calib"], splits["idx_aug"]]
+
+    # Unaugmented full corpus = all original docs
+    orig_all_tokens = original_tokens_for(docs, idx_all)
+    X_all_orig = tokens_to_dtm(orig_all_tokens, V)
+
+    # Augmented docs = accepted units from selected_by_doc (+ optionally extra_selected_units)
+    accepted_eval_units = [u for lst in selected_by_doc.values() for u in lst]
+    extra = extra_selected_units or []
+    aug_tokens = units_to_aug_docs(accepted_eval_units + extra)
+
+    # Build train corpora for LDA
+    X_unaug_train = tokens_to_dtm(orig_all_tokens, V)
+    X_aug_train   = tokens_to_dtm(orig_all_tokens + aug_tokens, V)
+
+    # Fit LDA on unaugmented full corpus; transform original docs
+    lda_u, phi_u, [W_all_u] = fit_lda_and_transform_many(
+        X_train=X_unaug_train,
+        X_list_to_transform=[X_all_orig],
+        K=phi.shape[0], alpha=1.0/phi.shape[0], beta=1.0/V, seed=seed
+    )
+
+    Theta_all_true = np.vstack([docs[i].theta for i in idx_all])
+    metrics_u, phi_u_aligned, W_all_u_aligned = _align_and_doc_theta_metrics(
+        phi_true=phi, phi_hat=phi_u, W_docs=W_all_u, Theta_true=Theta_all_true
+    )
+
+    # Fit LDA on augmented full corpus; transform original docs
+    lda_a, phi_a, [W_all_a] = fit_lda_and_transform_many(
+        X_train=X_aug_train,
+        X_list_to_transform=[X_all_orig],
+        K=phi.shape[0], alpha=1.0/phi.shape[0], beta=1.0/V, seed=seed
+    )
+    metrics_a, phi_a_aligned, W_all_a_aligned = _align_and_doc_theta_metrics(
+        phi_true=phi, phi_hat=phi_a, W_docs=W_all_a, Theta_true=Theta_all_true
+    )
+
+    # Topic drift (phi vs phi_hat) as mean per-topic norms
+    metrics_u["l1_drift_topic"] = float(np.mean(np.linalg.norm(phi - phi_u_aligned, ord=1, axis=1)))
+    metrics_u["l2_drift_topic"] = float(np.mean(np.linalg.norm(phi - phi_u_aligned, ord=2, axis=1)))
+    metrics_a["l1_drift_topic"] = float(np.mean(np.linalg.norm(phi - phi_a_aligned, ord=1, axis=1)))
+    metrics_a["l2_drift_topic"] = float(np.mean(np.linalg.norm(phi - phi_a_aligned, ord=2, axis=1)))
 
     return {
-        "miscoverage": miscover_cnt / max(1, n_docs),
-        "accept_rate": accepted_total / max(1, total_units),
-        "distinct_1": distinct_1(all_accepted_tokens),
-        "jsd_drift": float(np.mean(jsd_vals)) if jsd_vals else 0.0,
-        "l1_drift": float(np.mean(l1_vals)) if l1_vals else 0.0,
-        "l2_drift": float(np.mean(l2_vals)) if l2_vals else 0.0,
-        "l1_drift_topic":np.mean(np.linalg.norm( phi- phi_hat, ord=1)),
-        "l2_drift_topic": np.mean(np.linalg.norm( phi- phi_hat, ord=2))
+        **base,
+        "lda_full": {
+            "unaug_full": metrics_u,
+            "aug_full":   metrics_a,
+        }
     }
 
+
+# ------------------------------
+# Full-corpus LDA + downstream on unseen set
+# ------------------------------
 
 def evaluate_lda_and_downstream(cfg: SynthConfig,
                                 res: Dict[str, Any],
-                                seed: int = 0) -> Tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
-    phi        = res["phi"]
+                                seed: int = 0,
+                                n_unseen_eval_docs: int = 1000) -> Tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
+    """
+    LDA on FULL corpora (TRAIN+CALIB+TEST) with/without augmentation and
+    downstream evaluation on a NEW unseen synthetic set.
+    """
+    rng = np.random.default_rng(seed + 202)
+
+    phi_true   = res["phi"]
     docs       = res["docs"]
     aug_units  = res["aug_units"]
-    idx_train  = res["splits"]["idx_train"]
-    idx_aug    = res["splits"]["idx_aug"]
+    idx_train  = np.asarray(res["splits"]["idx_train"])
+    idx_calib  = np.asarray(res["splits"]["idx_calib"])
+    idx_aug    = np.asarray(res["splits"]["idx_aug"])
+    idx_all    = np.r_[idx_train, idx_calib, idx_aug]
+    V          = phi_true.shape[1]
 
-    # Originals for feature extraction (constant across variants)
-    orig_train_tokens = [flatten_doc(docs[i].sentences) for i in idx_train]
-    orig_test_tokens  = [flatten_doc(docs[i].sentences) for i in idx_aug]
-    X_orig_train = tokens_to_dtm(orig_train_tokens, cfg.V)
-    X_orig_test  = tokens_to_dtm(orig_test_tokens,  cfg.V)
-
-    # TRAIN augmented units
-    aug_train_units = [u for u in aug_units if u.doc_idx in set(idx_train)]
-
-    # Ensure predictions exist on TRAIN units
+    # Ensure predictions on train+calib units (needed for conditional selection)
+    aug_train_units  = [u for u in aug_units if u.doc_idx in set(idx_train)]
+    aug_calib_units  = [u for u in aug_units if u.doc_idx in set(idx_calib)]
     if any(np.isnan(getattr(u, "A_hat", np.nan)) or np.isnan(getattr(u, "A_obs_doc", np.nan))
-           for u in aug_train_units):
-        predict_for_units_doclevel(aug_train_units, res["reg"], res["idf"], res["phi"], target="obs")
+           for u in (aug_train_units + aug_calib_units)):
+        predict_for_units_doclevel(aug_train_units + aug_calib_units,
+                                   res["reg"], res["idf"], res["phi"], target="obs")
 
-    # ---------- Optional: build a conditional TRAIN set ----------
-    # Reuse calibration units from results; if missing, we can rebuild from aug_units
-    calib_units = res.get("calib_units", [u for u in aug_units if u.doc_idx in set(res["splits"]["idx_calib"])])
+    # Conditional selections for TRAIN and CALIB
     cc_train = fit_conditional_threshold_doclevel(
-        calib_units=calib_units,
-        test_units=aug_train_units,
-        idf=res["idf"],
-        phi=res["phi"],
-        lambda_obs=cfg.lambda_obs,
-        alpha_cp=cfg.alpha_cp,
-        rho=cfg.rho,
-        verbose=False,
+        calib_units=aug_calib_units, test_units=aug_train_units,
+        idf=res["idf"], phi=res["phi"],
+        lambda_obs=cfg.lambda_obs, alpha_cp=cfg.alpha_cp, rho=cfg.rho, verbose=False
     )
-    _, _, selected_by_doc_train, selected_train_units = cc_train
+    _, _, sel_by_doc_train, sel_train_units = cc_train
 
-    def unit_to_aug_tokens(u: Unit) -> List[int]:
-        toks = []
-        for s in u.doc_ctx: toks.extend(s)
-        for s in u.candidates: toks.extend(s)
-        return toks
+    cc_calib = fit_conditional_threshold_doclevel(
+        calib_units=aug_calib_units, test_units=aug_calib_units,
+        idf=res["idf"], phi=res["phi"],
+        lambda_obs=cfg.lambda_obs, alpha_cp=cfg.alpha_cp, rho=cfg.rho, verbose=False
+    )
+    _, _, sel_by_doc_calib, sel_calib_units = cc_calib
 
-    # Build training variants
-    train_variants: Dict[str, List[List[int]]] = {
-        "original":         [flatten_doc(docs[i].sentences) for i in idx_train],
-        "aug_unfiltered":   [unit_to_aug_tokens(u) for u in aug_train_units],
-        "aug_observed":     [unit_to_aug_tokens(u) for u in aug_train_units
-                             if not np.isnan(u.A_obs_doc) and u.A_obs_doc >= cfg.lambda_obs],
-        "aug_conditional":  [unit_to_aug_tokens(u) for u in selected_train_units],
+    # EVAL selections already available
+    sel_by_doc_eval = res["conditional"]["selected_by_doc"]
+    sel_eval_units  = [u for lst in sel_by_doc_eval.values() for u in lst]
+
+    # Build corpora
+    orig_all_tokens = original_tokens_for(docs, idx_all)                 # unaug_full originals
+    all_selected_units = sel_train_units + sel_calib_units + sel_eval_units
+    aug_tokens = units_to_aug_docs(all_selected_units)                   # accepted augmented docs
+
+    X_unaug_train = tokens_to_dtm(orig_all_tokens, V)                    # train LDA on originals
+    X_aug_train   = tokens_to_dtm(orig_all_tokens + aug_tokens, V)       # train LDA on originals + augmentations
+
+    X_all_orig    = tokens_to_dtm(orig_all_tokens, V)                    # transform: originals only
+
+    # NEW unseen test set (same phi_true)
+    cfg_unseen = SynthConfig(
+        V=cfg.V, K=cfg.K, beta=cfg.beta, alpha=cfg.alpha,
+        n_docs=n_unseen_eval_docs, S=cfg.S, L=cfg.L,
+        mask_frac=cfg.mask_frac, Kgen=cfg.Kgen,
+        delta=cfg.delta, epsilon=cfg.epsilon, T=cfg.T,
+        lambda_obs=cfg.lambda_obs, rho=cfg.rho, alpha_cp=cfg.alpha_cp,
+        n_train_docs=0, n_calib_docs=0, n_aug_docs=0, seed=seed + 777
+    )
+    unseen_docs = generate_corpus(cfg_unseen, phi_true, rng)
+    X_unseen_orig = tokens_to_dtm([flatten_doc(d.sentences) for d in unseen_docs], V)
+
+    Theta_all_true = np.vstack([docs[i].theta for i in idx_all])
+    Theta_unseen   = np.vstack([d.theta for d in unseen_docs])
+
+    # Fit two LDAs and compute topic/theta recovery on ALL original docs; also transform unseen
+    # Unaugmented full
+    lda_u, phi_u, [W_all_u, W_unseen_u] = fit_lda_and_transform_many(
+        X_train=X_unaug_train,
+        X_list_to_transform=[X_all_orig, X_unseen_orig],
+        K=cfg.K, alpha=cfg.alpha, beta=cfg.beta, seed=seed
+    )
+    met_u, phi_u_aligned, W_all_u_aligned = _align_and_doc_theta_metrics(
+        phi_true=phi_true, phi_hat=phi_u, W_docs=W_all_u, Theta_true=Theta_all_true
+    )
+    perm_u, _, _ = align_topics(phi_true, phi_u)
+    W_unseen_u_aligned = W_unseen_u[:, perm_u]
+
+    # Augmented full
+    lda_a, phi_a, [W_all_a, W_unseen_a] = fit_lda_and_transform_many(
+        X_train=X_aug_train,
+        X_list_to_transform=[X_all_orig, X_unseen_orig],
+        K=cfg.K, alpha=cfg.alpha, beta=cfg.beta, seed=seed
+    )
+    met_a, phi_a_aligned, W_all_a_aligned = _align_and_doc_theta_metrics(
+        phi_true=phi_true, phi_hat=phi_a, W_docs=W_all_a, Theta_true=Theta_all_true
+    )
+    perm_a, _, _ = align_topics(phi_true, phi_a)
+    W_unseen_a_aligned = W_unseen_a[:, perm_a]
+
+    # Topic drift (mean per-topic norms)
+    met_u["l1_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_u_aligned, ord=1, axis=1)))
+    met_u["l2_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_u_aligned, ord=2, axis=1)))
+    met_a["l1_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_a_aligned, ord=1, axis=1)))
+    met_a["l2_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_a_aligned, ord=2, axis=1)))
+
+    lda_results = {
+        "unaug_full": met_u,
+        "aug_full":   met_a,
     }
-    # Safety: if a bucket is empty, fall back to original
-    for name, toks in list(train_variants.items()):
-        if len(toks) == 0:
-            print(f"[WARN] Variant '{name}' produced 0 training docs; falling back to 'original'.")
-            train_variants[name] = train_variants["original"]
 
-    X_train_variants = {name: tokens_to_dtm(toks, cfg.V) for name, toks in train_variants.items()}
-
-    # Fit LDA & evaluate topic accuracy
-    lda_results: Dict[str, Dict[str, Any]] = {}
-    for name, Xtr in X_train_variants.items():
-        lda, phi_hat, Wtr, Wte = fit_lda_and_transform(
-            X_train=Xtr,
-            X_tr_for_features=X_orig_train,
-            X_test=X_orig_test,
-            K=cfg.K, alpha=cfg.alpha, beta=cfg.beta, seed=seed
-        )
-        perm, mean_jsd, mean_cos = align_topics(phi, phi_hat)
-        lda_results[name] = {
-            "lda": lda, "phi_hat": phi_hat, "perm": perm,
-            "phi_mean_jsd": mean_jsd, "phi_mean_cos": mean_cos,
-            "W_train": Wtr, "W_test": Wte,
-        }
-
-    # Synthetic outcomes from true θ (fixed across variants)
-    rng_out = np.random.default_rng(seed + 123)
-    #### Iterate the beta vectors for regression and classification a bunch of times
-    # to ensure that the downstream tasks are not biased by a single random seed.
-    for exp_down in range(10):
-        beta_reg = rng_out.normal(0, 1, size=cfg.K)
-        beta_clf = rng_out.normal(0, 1, size=cfg.K)
+    # ---------- Downstream tasks on completely unseen docs ----------
+    results_runs = []
+    for rep in range(10):
+        beta_reg = rng.normal(0, 1, size=cfg.K)
+        beta_clf = rng.normal(0, 1, size=cfg.K)
         def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
 
-        Theta_train = np.vstack([docs[i].theta for i in idx_train])
-        Theta_test  = np.vstack([docs[i].theta for i in idx_aug])
+        # outcomes from true thetas
+        y_reg_all    = Theta_all_true @ beta_reg + rng.normal(0, 0.1, size=Theta_all_true.shape[0])
+        y_reg_unseen = Theta_unseen   @ beta_reg + rng.normal(0, 0.1, size=Theta_unseen.shape[0])
 
-        y_reg_train = Theta_train @ beta_reg + rng_out.normal(0, 0.1, size=len(idx_train))
-        y_reg_test  = Theta_test  @ beta_reg + rng_out.normal(0, 0.1, size=len(idx_aug))
+        logit_all    = Theta_all_true @ beta_clf + rng.normal(0, 0.5, size=Theta_all_true.shape[0])
+        logit_unseen = Theta_unseen   @ beta_clf + rng.normal(0, 0.5, size=Theta_unseen.shape[0])
+        y_clf_all    = (sigmoid(logit_all)    > 0.5).astype(int)
+        y_clf_unseen = (sigmoid(logit_unseen) > 0.5).astype(int)
 
-        logit_train = Theta_train @ beta_clf + rng_out.normal(0, 0.5, size=len(idx_train))
-        logit_test  = Theta_test  @ beta_clf + rng_out.normal(0, 0.5, size=len(idx_aug))
-        y_clf_train = (sigmoid(logit_train) > 0.5).astype(int)
-        y_clf_test  = (sigmoid(logit_test)  > 0.5).astype(int)
-
-        downstream_metrics: Dict[str, Dict[str, float]] = {}
-        for name, resv in lda_results.items():
-            Wtr, Wte = resv["W_train"], resv["W_test"]
-
+        for tag, W_all, W_unseen in [
+            ("unaug_full", W_all_u_aligned, W_unseen_u_aligned),
+            ("aug_full",   W_all_a_aligned, W_unseen_a_aligned),
+        ]:
+            # regression
             reg_model = Ridge(alpha=1.0, random_state=seed)
-            reg_model.fit(Wtr, y_reg_train)
-            y_pred = reg_model.predict(Wte)
-            mse = mean_squared_error(y_reg_test, y_pred)
-            r2  = r2_score(y_reg_test, y_pred)
+            reg_model.fit(W_all, y_reg_all)
+            y_pred = reg_model.predict(W_unseen)
+            mse = mean_squared_error(y_reg_unseen, y_pred)
+            r2  = r2_score(y_reg_unseen, y_pred)
 
+            # classification
             clf_model = LogisticRegression(max_iter=1000, random_state=seed)
-            clf_model.fit(Wtr, y_clf_train)
-            y_proba = clf_model.predict_proba(Wte)[:, 1]
+            clf_model.fit(W_all, y_clf_all)
+            y_proba = clf_model.predict_proba(W_unseen)[:, 1]
             y_pred_cls = (y_proba >= 0.5).astype(int)
-            auc = roc_auc_score(y_clf_test, y_proba)
-            acc = accuracy_score(y_clf_test, y_pred_cls)
+            auc = roc_auc_score(y_clf_unseen, y_proba)
+            acc = accuracy_score(y_clf_unseen, y_pred_cls)
 
-            downstream_metrics[name + "_" + exp_down] = {
-                "name": name,
+            results_runs.append({
+                "bucket": tag,
                 "reg_mse": float(mse), "reg_r2": float(r2),
                 "clf_auc": float(auc), "clf_acc": float(acc),
-            }
-    # Aggregate results by converting to a DataFrame
-    downstream_metrics_df = pd.DataFrame.from_dict(downstream_metrics, orient='index')
-    downstream_metrics = downstream_metrics_df.groupby(name).mean().to_dict(orient='index')
-        
+            })
 
+    df = pd.DataFrame(results_runs)
+    downstream_metrics = df.groupby("bucket", sort=False).mean(numeric_only=True).to_dict(orient="index")
     return lda_results, downstream_metrics
 
-import pandas as pd
+
+# ------------------------------
+# Result packaging
+# ------------------------------
 
 def results_to_row(cfg: SynthConfig,
                    res: Dict[str, Any],
@@ -460,15 +580,25 @@ def results_to_row(cfg: SynthConfig,
         "base_obs_accept_rate": res["baselines"]["observed_filter"]["accept_rate"],
     }
 
-    # LDA/topic alignment + downstream (optional; add whichever buckets exist)
-    for bucket in ["original", "aug_unfiltered", "aug_observed", "aug_conditional"]:
-        if bucket in lda_results and bucket in downstream_metrics:
+    # Add new full-corpus buckets
+    for bucket in ["unaug_full", "aug_full"]:
+        if bucket in lda_results:
             row[f"topic_jsd_{bucket}"] = float(lda_results[bucket]["phi_mean_jsd"])
             row[f"topic_cos_{bucket}"] = float(lda_results[bucket]["phi_mean_cos"])
-            row[f"reg_mse_{bucket}"]   = float(downstream_metrics[bucket]["reg_mse"])
-            row[f"reg_r2_{bucket}"]    = float(downstream_metrics[bucket]["reg_r2"])
-            row[f"clf_auc_{bucket}"]   = float(downstream_metrics[bucket]["clf_auc"])
-            row[f"clf_acc_{bucket}"]   = float(downstream_metrics[bucket]["clf_acc"])
+            row[f"theta_l1_{bucket}"]  = float(lda_results[bucket]["theta_l1_mean"])
+            row[f"theta_l2_{bucket}"]  = float(lda_results[bucket]["theta_l2_mean"])
+            # topic drift norms if present
+            if "l1_drift_topic" in lda_results[bucket]:
+                row[f"phi_l1_{bucket}"] = float(lda_results[bucket]["l1_drift_topic"])
+            if "l2_drift_topic" in lda_results[bucket]:
+                row[f"phi_l2_{bucket}"] = float(lda_results[bucket]["l2_drift_topic"])
+
+        if bucket in downstream_metrics:
+            row[f"reg_mse_{bucket}"] = float(downstream_metrics[bucket]["reg_mse"])
+            row[f"reg_r2_{bucket}"]  = float(downstream_metrics[bucket]["reg_r2"])
+            row[f"clf_auc_{bucket}"] = float(downstream_metrics[bucket]["clf_auc"])
+            row[f"clf_acc_{bucket}"] = float(downstream_metrics[bucket]["clf_acc"])
+
     return row
 
 
@@ -485,8 +615,8 @@ def run_synthetic_experiment(cfg: SynthConfig,
       2) Build base units with Kgen candidates per masked sent (doc-level)
       3) Build Kgen augmented doc Units per original doc
       4) Train A_hat regressor on TRAIN augmented docs
-      5) Calibrate global s* via split-conformal on CALIB docs
-      6) Evaluate on AUG (CP filter vs baselines)
+      5) Calibrate conditional thresholds on CALIB; select on EVAL
+      6) Evaluate selection metrics; return artifacts
     """
     set_seed(cfg.seed)
     rng = default_rng(cfg.seed)
@@ -517,121 +647,86 @@ def run_synthetic_experiment(cfg: SynthConfig,
     reg = RandomForestRegressor(n_estimators=300, max_depth=None, random_state=cfg.seed, n_jobs=-1)
     reg.fit(X_train, y_train)
 
-    import matplotlib.pyplot as plt
-
-    _, y_train_oracle, _ = assemble_feature_label_arrays_doclevel(train_units,  idf, phi, target="oracle",
-    oracle_mode="cosine",  # or "mean_prob" if you prefer
-    as_log=False)
-    
-
+    # Compute correlations on calib (for monitoring)
     calib_units = [u for u in aug_units if u.doc_idx in set(idx_calib)]
-    X_calib, y_calib, idx_calib_triplets = assemble_feature_label_arrays_doclevel(calib_units, idf, phi, target="observed",
-        oracle_mode="cosine",  # or "mean_prob" if you prefer
-        as_log=False)
-
-    _, y_calib_oracle, _ = assemble_feature_label_arrays_doclevel(calib_units, idf, phi, target="oracle",
-        oracle_mode="cosine",  # or "mean_prob" if you prefer
-        as_log=False)
-
-
-    corr_calib_ahat = np.corrcoef(reg.predict(X_calib), y_calib)[0, 1]
-
-    # #### Make nice plot
-    # plt.figure(figsize=(10, 6))
-    # plt.scatter(reg.predict(X_train), y_train, alpha=0.3, label='Train Predictions')
-    # plt.scatter(reg.predict(X_calib), y_calib, alpha=0.3, label='Calib Predictions')
-    # plt.xlabel('Predicted A_hat')
-    # plt.ylabel('True A_obs')
-    # plt.title('Predicted vs True A_obs: correlation on calib = {:.3f}'.format(r2))
-    # plt.legend()
-    # plt.grid(True)
-    # plt.show()
-
-
-    # import matplotlib.pyplot as plt
-    # ### Make nice plot
-    corr_calib_oracle = np.corrcoef(reg.predict(X_calib), y_calib_oracle)[0, 1]
-    # plt.figure(figsize=(10, 6))
-    # plt.scatter(reg.predict(X_train), y_train_oracle, alpha=0.3, label='Train Predictions')
-    # plt.scatter(reg.predict(X_calib), y_calib_oracle, alpha=0.3, label='Calib Predictions')
-    # plt.xlabel('Predicted A_hat')
-    # plt.ylabel('Oracle A_star')
-    # plt.title('Predicted vs Oracle A_star: correlation on calib = {:.3f}'.format(r2))
-    # plt.legend()
-    # plt.grid(True)
-    # plt.show()
-
-
-
-    predict_for_units_doclevel(train_units, reg, idf, phi, target="obs")  # <<< NEW
-
-    # Predict A_hat for CALIB and AUG docs (also sets A_obs_doc)
-    calib_units = [u for u in aug_units if u.doc_idx in set(idx_calib)]
-    eval_units  = [u for u in aug_units if u.doc_idx in set(idx_aug)]
-
+    X_calib, y_calib, _ = assemble_feature_label_arrays_doclevel(
+        calib_units, idf, phi, target="observed", oracle_mode="cosine", as_log=False
+    )
+    _, y_calib_oracle, _ = assemble_feature_label_arrays_doclevel(
+        calib_units, idf, phi, target="oracle", oracle_mode="cosine", as_log=False
+    )
+    corr_calib_ahat   = float(np.corrcoef(reg.predict(X_calib), y_calib)[0, 1])
+    corr_calib_oracle = float(np.corrcoef(reg.predict(X_calib), y_calib_oracle)[0, 1])
     if verbose:
-        print(f"Training on {len(train_units)} augmented docs; calibrating on {len(calib_units)}; evaluating on {len(eval_units)}.")
+        print(f"[MON] corr(pred, A_obs) calib={corr_calib_ahat:.3f} | corr(pred, A_star) calib={corr_calib_oracle:.3f}")
 
+    # Predict A_hat for TRAIN/CALIB/EVAL
+    eval_units  = [u for u in aug_units if u.doc_idx in set(idx_aug)]
+    predict_for_units_doclevel(train_units, reg, idf, phi, target="obs")
     predict_for_units_doclevel(calib_units, reg, idf, phi, target="obs")
     predict_for_units_doclevel(eval_units,  reg, idf, phi, target="obs")
 
-    # Build doc->units dicts (same Unit objects)
-    calib_by_doc: Dict[int, List[Unit]] = {}
-    for u in calib_units: calib_by_doc.setdefault(u.doc_idx, []).append(u)
-    aug_by_doc: Dict[int, List[Unit]] = {}
-    for u in eval_units:  aug_by_doc.setdefault(u.doc_idx, []).append(u)
-
-    # 6) Global CP threshold & metrics
+    # 6) Conditional thresholds (fit on calib, apply to eval)
+    if verbose:
+        print(f"Training on {len(train_units)} augmented docs; calibrating on {len(calib_units)}; evaluating on {len(eval_units)}.")
 
     cc_model, thresholds_by_doc, selected_by_doc, selected_units = fit_conditional_threshold_doclevel(
-                        calib_units=calib_units,
-                        test_units=eval_units,
-                        idf=idf,
-                        phi=phi,
-                        lambda_obs=0.06,
-                        alpha_cp=0.05,
-                        rho = 0,
-                        verbose=True,
-                    )
-    
-    # Total augmented per eval doc (denominator for accept rate)
+        calib_units=calib_units,
+        test_units=eval_units,
+        idf=idf,
+        phi=phi,
+        lambda_obs=cfg.lambda_obs,
+        alpha_cp=cfg.alpha_cp,
+        rho=cfg.rho,
+        verbose=True,
+    )
+
+    # Per-doc denominators for accept-rate on eval
     doc_total_eval: Dict[int, int] = {}
     for u in eval_units:
         doc_total_eval[u.doc_idx] = doc_total_eval.get(u.doc_idx, 0) + 1
 
-    # Conditional selection metrics
-    cc_metrics = evaluate_selected_doclevel(selected_by_doc,
-                                            doc_total_eval,
-                                            phi,
-                                            lambda_obs=cfg.lambda_obs,
-                                            rho=cfg.rho)
+    # Selection metrics; optionally include full-corpus LDA comparison (eval acceptances only here)
+    cc_metrics = evaluate_selected_doclevel(
+        selected_by_doc,
+        doc_total_eval,
+        phi,
+        lambda_obs=cfg.lambda_obs,
+        rho=cfg.rho,
+        full_corpus_lda=True,                      # compare unaug vs (unaug + eval-accepts)
+        docs=docs,
+        splits={"idx_train": idx_train, "idx_calib": idx_calib, "idx_aug": idx_aug},
+        seed=cfg.seed
+    )
 
-    # Baseline: accept everything
+    # Baselines on eval
     selected_unfiltered_by_doc: Dict[int, List[Unit]] = {}
     for u in eval_units:
         selected_unfiltered_by_doc.setdefault(u.doc_idx, []).append(u)
-    baseline_unfiltered = evaluate_selected_doclevel(selected_unfiltered_by_doc,
-                                                     doc_total_eval, phi, cfg.lambda_obs, cfg.rho)
 
-    # Baseline: accept if observed >= lambda
+    baseline_unfiltered = evaluate_selected_doclevel(
+        selected_unfiltered_by_doc, doc_total_eval, phi, cfg.lambda_obs, cfg.rho
+    )
+
     selected_observed_by_doc: Dict[int, List[Unit]] = {}
     for u in eval_units:
         if float(u.A_obs_doc) >= float(cfg.lambda_obs):
             selected_observed_by_doc.setdefault(u.doc_idx, []).append(u)
-    baseline_observed = evaluate_selected_doclevel(selected_observed_by_doc,
-                                                   doc_total_eval, phi, cfg.lambda_obs, cfg.rho)
+
+    baseline_observed = evaluate_selected_doclevel(
+        selected_observed_by_doc, doc_total_eval, phi, cfg.lambda_obs, cfg.rho
+    )
 
     # Pretty print
     n_sel = sum(len(v) for v in selected_by_doc.values())
     n_tot = sum(doc_total_eval.values())
     if verbose:
-        print(f"[CC-LDA] Selected generations: {n_sel} / {n_tot} "
-              f"({100.0 * n_sel / max(1, n_tot):.1f}%)")
-        print(f"[CC-LDA] Metrics (conditional): {cc_metrics}")
+        print(f"[CC] Selected generations: {n_sel} / {n_tot} ({100.0 * n_sel / max(1, n_tot):.1f}%)")
+        print(f"[CC] Metrics (conditional): {cc_metrics}")
         print(f"[BASE] Unfiltered: {baseline_unfiltered}")
-        print(f"[BASE] Observed   : {baseline_observed}")
+        print(f"[BASE] Observed  : {baseline_observed}")
 
-    # Package results once (no s_global in conditional pipeline)
+    # Package results
     results = {
         "config": cfg,
         "splits": {"idx_train": idx_train, "idx_calib": idx_calib, "idx_aug": idx_aug},
@@ -658,38 +753,38 @@ def run_synthetic_experiment(cfg: SynthConfig,
     return results
 
 
-
 # =========================
 # Example run
 # =========================
 if __name__ == "__main__":
-    import pandas as pd
+    os.makedirs("results", exist_ok=True)
     results_df = pd.DataFrame()
-    # You set rho=10 below; for doc-level CP the natural setting is rho=0.
 
     for alpha_cp in [0.05, 0.1, 0.2]:
-                        cfg = SynthConfig(
-                            V=1000, K=3, beta=0.1, alpha=0.3,
-                            n_docs=n_train + n_calib + 500, S=10, L=12, mask_frac=0.5, Kgen=20,
-                            delta=delta, epsilon=epsilon, T=temp,
-                            lambda_obs=0.01, rho=10, alpha_cp=alpha_cp,
-                            n_train_docs=n_train, n_calib_docs=n_calib, n_aug_docs=500,
-                            seed=SEED
-                        )
-                        for lambda_obs in [0.05, 0.1, 0.25, 0.35]:
-                            for rho in [0, 1, 2, 5, 10]:
-                                cfg.rho = rho
-                                cfg.alpha_cp = alpha_cp
-                                cfg.lambda_obs = lambda_obs
-                                res = run_synthetic_experiment(cfg)
-                                print(f"Config: {cfg}, Results: {res['conditional']['metrics']}")
-                                lda_results, downstream_metrics = evaluate_lda_and_downstream(cfg, res, seed=cfg.seed)
-                                row = results_to_row(cfg, res, lda_results, downstream_metrics)
-                                results_df = pd.concat([results_df, pd.DataFrame([row])], ignore_index=True)
-                                results_df.to_csv("results/synthetic_results_llm_cp_" +name_exp + ".csv", index=False)
+        cfg = SynthConfig(
+            V=1000, K=3, beta=0.1, alpha=0.3,
+            n_docs=n_train + n_calib + 500, S=10, L=12, mask_frac=0.5, Kgen=20,
+            delta=delta, epsilon=epsilon, T=temp,
+            lambda_obs=0.01, rho=10, alpha_cp=alpha_cp,
+            n_train_docs=n_train, n_calib_docs=n_calib, n_aug_docs=500,
+            seed=SEED
+        )
+        for lambda_obs in [0.05, 0.1, 0.25, 0.35]:
+            for rho in [0, 1, 2, 5, 10]:
+                cfg.rho = rho
+                cfg.alpha_cp = alpha_cp
+                cfg.lambda_obs = lambda_obs
 
-                                print(results_df.tail(1))  # last row just added
-                                print("Done")
+                res = run_synthetic_experiment(cfg)
+                print(f"Config: {cfg}, Results: {res['conditional']['metrics']}")
 
+                # Full-corpus LDA + downstream on unseen set
+                lda_results, downstream_metrics = evaluate_lda_and_downstream(cfg, res, seed=cfg.seed)
 
+                row = results_to_row(cfg, res, lda_results, downstream_metrics)
+                results_df = pd.concat([results_df, pd.DataFrame([row])], ignore_index=True)
+                out_path = os.path.join("results", f"synthetic_results_llm_cp_{name_exp}.csv")
+                results_df.to_csv(out_path, index=False)
 
+                print(results_df.tail(1))  # last row just added
+                print("Done")
