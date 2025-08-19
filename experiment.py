@@ -17,7 +17,7 @@ from scipy.optimize import linear_sum_assignment
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.decomposition import LatentDirichletAllocation
-from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.linear_model import Ridge, LogisticRegression, LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score, roc_auc_score, accuracy_score
 
 import pandas as pd
@@ -269,13 +269,141 @@ def _align_and_doc_theta_metrics(phi_true: np.ndarray,
 # Selection metrics + optional full-corpus LDA comparison
 # ------------------------------
 
+
+import numpy as np
+from typing import List, Tuple, Dict, Any, Sequence, Optional
+from scipy.sparse import csr_matrix
+
+# ---------- Lexical helpers ----------
+def _corpus_ngram_set(token_lists: List[List[int]], n: int = 1) -> set:
+    S = set()
+    if n == 1:
+        for doc in token_lists:
+            S.update(doc)
+    else:
+        for doc in token_lists:
+            if len(doc) >= n:
+                S.update(tuple(doc[i:i+n]) for i in range(len(doc)-n+1))
+    return S
+
+def _distinct_n(token_lists: List[List[int]], n: int = 1) -> float:
+    total = sum(max(0, len(doc)-n+1) if n > 1 else len(doc) for doc in token_lists)
+    if total == 0:
+        return 0.0
+    S = _corpus_ngram_set(token_lists, n=n)
+    return len(S) / float(total)
+
+def _lexical_diversity_metrics(orig_tokens: List[List[int]],
+                               aug_tokens:  List[List[int]]) -> Dict[str, float]:
+    # distinct-n
+    d1_o = _distinct_n(orig_tokens, n=1)
+    d2_o = _distinct_n(orig_tokens, n=2)
+    d1_a = _distinct_n(orig_tokens + aug_tokens, n=1)
+    d2_a = _distinct_n(orig_tokens + aug_tokens, n=2)
+
+    # type coverage and Jaccard
+    Uo1 = _corpus_ngram_set(orig_tokens, n=1)
+    Ua1 = _corpus_ngram_set(orig_tokens + aug_tokens, n=1)
+    Uo2 = _corpus_ngram_set(orig_tokens, n=2)
+    Ua2 = _corpus_ngram_set(orig_tokens + aug_tokens, n=2)
+
+    new_vocab_frac = 0.0 if len(Ua1) == 0 else len(Ua1 - Uo1) / float(len(Ua1))
+    jacc1 = 0.0 if (len(Uo1|Ua1) == 0) else len(Uo1 & Ua1) / float(len(Uo1 | Ua1))
+    jacc2 = 0.0 if (len(Uo2|Ua2) == 0) else len(Uo2 & Ua2) / float(len(Uo2 | Ua2))
+
+    return {
+        "distinct1_unaug": d1_o, "distinct2_unaug": d2_o,
+        "distinct1_with_aug": d1_a, "distinct2_with_aug": d2_a,
+        "new_vocab_frac": new_vocab_frac,
+        "jaccard_unigram": jacc1, "jaccard_bigram": jacc2,
+    }
+
+# ---------- Document-space helpers (tf/random projection) ----------
+def _row_l2_normalize_dense(X: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
+    return X / norms
+
+def _effective_num_points_from_dense_unit_rows(Z: np.ndarray, block: int = 2048) -> float:
+    """
+    Z: (n,d) with each row L2-normalized. Computes ENP = n^2 / sum_{ij} (cos_ij)^2
+    in blocks to keep memory manageable.
+    """
+    n = Z.shape[0]
+    if n == 0:
+        return 0.0
+    fro2 = 0.0
+    for i in range(0, n, block):
+        Gi = Z[i:i+block] @ Z.T         # (b, n)
+        fro2 += float(np.sum(Gi * Gi))  # squared Frobenius
+    return (n * n) / max(fro2, 1e-12)
+
+def _dup_rate_from_dense_unit_rows(Z: np.ndarray, tau: float = 0.95, block: int = 2048) -> float:
+    """
+    Fraction of rows whose maximum cosine similarity to any other row >= tau.
+    """
+    n = Z.shape[0]
+    if n <= 1:
+        return 0.0
+    hits = 0
+    for i in range(0, n, block):
+        b = min(block, n - i)
+        Gi = Z[i:i+b] @ Z.T  # (b, n)
+        # suppress self-similarity on the block diagonal
+        for r, j in enumerate(range(i, i+b)):
+            Gi[r, j] = -1.0
+        hits += int(np.sum(np.max(Gi, axis=1) >= tau))
+    return hits / float(n)
+
+def _random_projection_enp_and_dups(X_csr: csr_matrix,
+                                    rp_dim: int = 256,
+                                    seed: int = 0,
+                                    tau_dup: float = 0.95,
+                                    block: int = 2048) -> Tuple[float, float]:
+    """
+    Projects csr TF matrix to low-dim dense space, L2-normalizes rows,
+    returns (ENP, dup_rate).
+    """
+    n, V = X_csr.shape
+    if n == 0:
+        return 0.0, 0.0
+    rng = np.random.default_rng(seed)
+    R = rng.normal(0.0, 1.0 / np.sqrt(rp_dim), size=(V, rp_dim))  # Gaussian RP
+    # TF (not TF-IDF): normalize rows to unit L2 first to make cosine meaningful
+    # Compute row norms for TF
+    row_norms = np.sqrt(X_csr.multiply(X_csr).sum(axis=1)).A1 + 1e-12
+    Xn = X_csr.multiply(1.0 / row_norms[:, None])                  # csr
+    Z = Xn @ R                                                     # dense (n, rp_dim)
+    Z = _row_l2_normalize_dense(Z)
+    enp = _effective_num_points_from_dense_unit_rows(Z, block=block)
+    dup = _dup_rate_from_dense_unit_rows(Z, tau=tau_dup, block=block)
+    return enp, dup
+
+# ---------- Topic-space helpers ----------
+def _effective_num_points_topic(W: np.ndarray, block: int = 8192) -> float:
+    """
+    ENP in topic space. W may be any nonnegative doc-topic weights.
+    We L2-normalize rows and apply the same participation ratio.
+    """
+    if W.size == 0:
+        return 0.0
+    Z = _row_l2_normalize_dense(W)
+    return _effective_num_points_from_dense_unit_rows(Z, block=block)
+
+def _dup_rate_topic(W: np.ndarray, tau: float = 0.95, block: int = 8192) -> float:
+    if W.size == 0:
+        return 0.0
+    Z = _row_l2_normalize_dense(W)
+    return _dup_rate_from_dense_unit_rows(Z, tau=tau, block=block)
+
+
+
 def evaluate_selected_doclevel(selected_by_doc: Dict[int, List[Unit]],
                                doc_total_units: Dict[int, int],
                                phi: np.ndarray,
                                lambda_obs: float,
                                rho: int,
                                *,
-                               full_corpus_lda: bool = False,
+                               full_corpus_lda: bool = True,
                                docs: Optional[List[Document]] = None,
                                splits: Optional[Dict[str, np.ndarray]] = None,
                                extra_selected_units: Optional[List[Unit]] = None,
@@ -386,11 +514,83 @@ def evaluate_selected_doclevel(selected_by_doc: Dict[int, List[Unit]],
     metrics_a["l1_drift_topic"] = float(np.mean(np.linalg.norm(phi - phi_a_aligned, ord=1, axis=1)))
     metrics_a["l2_drift_topic"] = float(np.mean(np.linalg.norm(phi - phi_a_aligned, ord=2, axis=1)))
 
+    ##### Need to measure the diversity of the augmented docs
+
+        # ---------- Diversity of (unaug) vs (with aug) corpora ----------
+    # 1) Lexical metrics (distinct-n, new types, Jaccard)
+    lex_metrics = _lexical_diversity_metrics(orig_all_tokens, aug_tokens)
+
+    # 2) Document-space (TF) ENP and near-duplicate rate via random projection
+    #    (use the *same* random seed so the comparison is fair)
+    ENP_unaug_tf, dup_unaug_tf = _random_projection_enp_and_dups(
+        X_unaug_train, rp_dim=256, seed=seed, tau_dup=0.95, block=2048
+    )
+    ENP_with_aug_tf, dup_with_aug_tf = _random_projection_enp_and_dups(
+        X_aug_train, rp_dim=256, seed=seed, tau_dup=0.95, block=2048
+    )
+
+    # 3) Topic-space ENP / near-duplicate rate
+    #    (a) on originals under the unaug LDA (already aligned): W_all_u_aligned
+    ENP_unaug_topic = _effective_num_points_topic(W_all_u_aligned, block=8192)
+    dup_unaug_topic = _dup_rate_topic(W_all_u_aligned, tau=0.95, block=8192)
+
+    #    (b) on originals+augmented docs under the aug LDA
+    #        - transform augmented docs and align columns using perm_a
+    X_aug_docs_only = tokens_to_dtm(aug_tokens, phi.shape[1])
+    W_aug_docs = lda_a.transform(X_aug_docs_only)  # (n_aug_docs, K)
+    # We already computed 'perm_a' above when aligning phi_a; reuse it:
+    W_aug_docs_aligned = W_aug_docs[:, perm_a]
+
+    W_full_with_aug = np.vstack([W_all_a_aligned, W_aug_docs_aligned])
+    ENP_with_aug_topic = _effective_num_points_topic(W_full_with_aug, block=8192)
+    dup_with_aug_topic = _dup_rate_topic(W_full_with_aug, tau=0.95, block=8192)
+
+    # Attach to metrics dicts
+    diversity_block = {
+        # lexical
+        **lex_metrics,
+        # TF doc-space
+        "enp_tf_unaug": ENP_unaug_tf,
+        "enp_tf_with_aug": ENP_with_aug_tf,
+        "dup_rate_tf_unaug": dup_unaug_tf,
+        "dup_rate_tf_with_aug": dup_with_aug_tf,
+        # topic doc-space
+        "enp_topic_unaug": ENP_unaug_topic,
+        "enp_topic_with_aug": ENP_with_aug_topic,
+        "dup_rate_topic_unaug": dup_unaug_topic,
+        "dup_rate_topic_with_aug": dup_with_aug_topic,
+    }
+
+    # You can keep them as a separate subtree or merge:
+    metrics_u.update({
+        "enp_tf": ENP_unaug_tf,
+        "dup_rate_tf": dup_unaug_tf,
+        "enp_topic": ENP_unaug_topic,
+        "dup_rate_topic": dup_unaug_topic,
+        # propagate lexical baselines on the unaug side for convenience
+        "distinct1": lex_metrics["distinct1_unaug"],
+        "distinct2": lex_metrics["distinct2_unaug"],
+    })
+
+    metrics_a.update({
+        "enp_tf": ENP_with_aug_tf,
+        "dup_rate_tf": dup_with_aug_tf,
+        "enp_topic": ENP_with_aug_topic,
+        "dup_rate_topic": dup_with_aug_topic,
+        "distinct1": lex_metrics["distinct1_with_aug"],
+        "distinct2": lex_metrics["distinct2_with_aug"],
+        "new_vocab_frac": lex_metrics["new_vocab_frac"],
+        "jaccard_unigram": lex_metrics["jaccard_unigram"],
+        "jaccard_bigram": lex_metrics["jaccard_bigram"],
+    })
+
+    # If your function returns a combined dict, include the diversity info:
     return {
         **base,
         "lda_full": {
             "unaug_full": metrics_u,
             "aug_full":   metrics_a,
+            "diversity":  diversity_block,  # optional: consolidated view
         }
     }
 
@@ -402,11 +602,25 @@ def evaluate_selected_doclevel(selected_by_doc: Dict[int, List[Unit]],
 def evaluate_lda_and_downstream(cfg: SynthConfig,
                                 res: Dict[str, Any],
                                 seed: int = 0,
-                                n_unseen_eval_docs: int = 1000) -> Tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
+                                n_unseen_eval_docs: int = 1000,
+                                include_train_aug: bool = False,
+                                include_calib_aug: bool = False
+                                ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
     """
-    LDA on FULL corpora (TRAIN+CALIB+TEST) with/without augmentation and
+    LDA on FULL corpora (TRAIN+CALIB+TEST) with four variants and
     downstream evaluation on a NEW unseen synthetic set.
+
+    Buckets:
+      - 'unaug_full'          : originals only
+      - 'aug_full_cp'         : originals + CP-selected eval augmentations
+      - 'aug_full_unfiltered' : originals + all eval augmentations
+      - 'aug_full_obs'        : originals + eval augmentations with A_obs >= lambda
+
+    Optional flags can include CP-selected TRAIN/CALIB augmentations in 'aug_full_cp'.
     """
+    import pandas as pd
+    from sklearn.linear_model import LinearRegression, LogisticRegression
+
     rng = np.random.default_rng(seed + 202)
 
     phi_true   = res["phi"]
@@ -418,44 +632,63 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
     idx_all    = np.r_[idx_train, idx_calib, idx_aug]
     V          = phi_true.shape[1]
 
-    # Ensure predictions on train+calib units (needed for conditional selection)
-    aug_train_units  = [u for u in aug_units if u.doc_idx in set(idx_train)]
-    aug_calib_units  = [u for u in aug_units if u.doc_idx in set(idx_calib)]
-    if any(np.isnan(getattr(u, "A_hat", np.nan)) or np.isnan(getattr(u, "A_obs_doc", np.nan))
-           for u in (aug_train_units + aug_calib_units)):
-        predict_for_units_doclevel(aug_train_units + aug_calib_units,
-                                   res["reg"], res["idf"], res["phi"], target="obs")
+    # ---------- originals (train+calib+test) ----------
+    orig_all_tokens = [flatten_doc(docs[i].sentences) for i in idx_all]
+    X_all_orig = tokens_to_dtm(orig_all_tokens, V)
+    X_unaug_train = X_all_orig  # train matrix for 'unaug_full'
 
-    # Conditional selections for TRAIN and CALIB
-    cc_train = fit_conditional_threshold_doclevel(
-        calib_units=aug_calib_units, test_units=aug_train_units,
-        idf=res["idf"], phi=res["phi"],
-        lambda_obs=cfg.lambda_obs, alpha_cp=cfg.alpha_cp, rho=cfg.rho, verbose=False
-    )
-    _, _, sel_by_doc_train, sel_train_units = cc_train
+    # ---------- augmentation pools (EVAL only by default) ----------
+    # Ensure eval units have A_obs/A_hat already (run_synthetic_experiment should have done this)
+    eval_units_all = [u for u in aug_units if u.doc_idx in set(idx_aug)]
+    eval_units_obs = [u for u in eval_units_all if not np.isnan(u.A_obs_doc) and u.A_obs_doc >= float(cfg.lambda_obs)]
 
-    cc_calib = fit_conditional_threshold_doclevel(
-        calib_units=aug_calib_units, test_units=aug_calib_units,
-        idf=res["idf"], phi=res["phi"],
-        lambda_obs=cfg.lambda_obs, alpha_cp=cfg.alpha_cp, rho=cfg.rho, verbose=False
-    )
-    _, _, sel_by_doc_calib, sel_calib_units = cc_calib
-
-    # EVAL selections already available
+    # CP-selected eval units come from the saved selection
     sel_by_doc_eval = res["conditional"]["selected_by_doc"]
-    sel_eval_units  = [u for lst in sel_by_doc_eval.values() for u in lst]
+    eval_units_cp = [u for lst in sel_by_doc_eval.values() for u in lst]
 
-    # Build corpora
-    orig_all_tokens = original_tokens_for(docs, idx_all)                 # unaug_full originals
-    all_selected_units = sel_train_units + sel_calib_units + sel_eval_units
-    aug_tokens = units_to_aug_docs(all_selected_units)                   # accepted augmented docs
+    # Optionally add TRAIN/CALIB CP-selected units to the CP bucket
+    extra_cp_units: List[Unit] = []
+    if include_train_aug or include_calib_aug:
+        # we may need predictions for train/calib if not already present
+        train_units_all = [u for u in aug_units if u.doc_idx in set(idx_train)]
+        calib_units_all = [u for u in aug_units if u.doc_idx in set(idx_calib)]
+        if any(np.isnan(getattr(u, "A_hat", np.nan)) or np.isnan(getattr(u, "A_obs_doc", np.nan))
+               for u in (train_units_all + calib_units_all)):
+            predict_for_units_doclevel(train_units_all + calib_units_all,
+                                       res["reg"], res["idf"], res["phi"], target="obs")
 
-    X_unaug_train = tokens_to_dtm(orig_all_tokens, V)                    # train LDA on originals
-    X_aug_train   = tokens_to_dtm(orig_all_tokens + aug_tokens, V)       # train LDA on originals + augmentations
+        if include_train_aug:
+            cc_train = fit_conditional_threshold_doclevel(
+                calib_units=calib_units_all, test_units=train_units_all,
+                idf=res["idf"], phi=res["phi"],
+                lambda_obs=cfg.lambda_obs, alpha_cp=cfg.alpha_cp, rho=cfg.rho, verbose=False
+            )
+            _, _, sel_by_doc_train, sel_train_units = cc_train
+            extra_cp_units.extend(sel_train_units)
 
-    X_all_orig    = tokens_to_dtm(orig_all_tokens, V)                    # transform: originals only
+        if include_calib_aug:
+            cc_calib = fit_conditional_threshold_doclevel(
+                calib_units=calib_units_all, test_units=calib_units_all,
+                idf=res["idf"], phi=res["phi"],
+                lambda_obs=cfg.lambda_obs, alpha_cp=cfg.alpha_cp, rho=cfg.rho, verbose=False
+            )
+            _, _, sel_by_doc_calib, sel_calib_units = cc_calib
+            extra_cp_units.extend(sel_calib_units)
 
-    # NEW unseen test set (same phi_true)
+    # ---------- training corpora for each bucket ----------
+    def units_to_docs(units: List[Unit]) -> List[List[int]]:
+        return [unit_to_aug_tokens(u) for u in units]
+
+    corpora_train = {
+        "unaug_full":          orig_all_tokens,
+        "aug_full_cp":         orig_all_tokens + units_to_docs(eval_units_cp + extra_cp_units),
+        "aug_full_unfiltered": orig_all_tokens + units_to_docs(eval_units_all),
+        "aug_full_obs":        orig_all_tokens + units_to_docs(eval_units_obs),
+    }
+
+    X_train_by_bucket = {k: tokens_to_dtm(v, V) for k, v in corpora_train.items()}
+
+    # ---------- new unseen set ----------
     cfg_unseen = SynthConfig(
         V=cfg.V, K=cfg.K, beta=cfg.beta, alpha=cfg.alpha,
         n_docs=n_unseen_eval_docs, S=cfg.S, L=cfg.L,
@@ -470,43 +703,34 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
     Theta_all_true = np.vstack([docs[i].theta for i in idx_all])
     Theta_unseen   = np.vstack([d.theta for d in unseen_docs])
 
-    # Fit two LDAs and compute topic/theta recovery on ALL original docs; also transform unseen
-    # Unaugmented full
-    lda_u, phi_u, [W_all_u, W_unseen_u] = fit_lda_and_transform_many(
-        X_train=X_unaug_train,
-        X_list_to_transform=[X_all_orig, X_unseen_orig],
-        K=cfg.K, alpha=cfg.alpha, beta=cfg.beta, seed=seed
-    )
-    met_u, phi_u_aligned, W_all_u_aligned = _align_and_doc_theta_metrics(
-        phi_true=phi_true, phi_hat=phi_u, W_docs=W_all_u, Theta_true=Theta_all_true
-    )
-    perm_u, _, _ = align_topics(phi_true, phi_u)
-    W_unseen_u_aligned = W_unseen_u[:, perm_u]
+    # ---------- fit one LDA per bucket; compute topic/theta recovery ----------
+    lda_results: Dict[str, Dict[str, float]] = {}
+    W_all_aligned_by_bucket: Dict[str, np.ndarray]   = {}
+    W_unseen_aligned_by_bucket: Dict[str, np.ndarray] = {}
 
-    # Augmented full
-    lda_a, phi_a, [W_all_a, W_unseen_a] = fit_lda_and_transform_many(
-        X_train=X_aug_train,
-        X_list_to_transform=[X_all_orig, X_unseen_orig],
-        K=cfg.K, alpha=cfg.alpha, beta=cfg.beta, seed=seed
-    )
-    met_a, phi_a_aligned, W_all_a_aligned = _align_and_doc_theta_metrics(
-        phi_true=phi_true, phi_hat=phi_a, W_docs=W_all_a, Theta_true=Theta_all_true
-    )
-    perm_a, _, _ = align_topics(phi_true, phi_a)
-    W_unseen_a_aligned = W_unseen_a[:, perm_a]
+    for bucket, Xtr in X_train_by_bucket.items():
+        lda, phi_hat, [W_all, W_unseen] = fit_lda_and_transform_many(
+            X_train=Xtr,
+            X_list_to_transform=[X_all_orig, X_unseen_orig],
+            K=cfg.K, alpha=cfg.alpha, beta=cfg.beta, seed=seed
+        )
+        # metrics on ALL original docs
+        met, phi_hat_aligned, W_all_aligned = _align_and_doc_theta_metrics(
+            phi_true=phi_true, phi_hat=phi_hat, W_docs=W_all, Theta_true=Theta_all_true
+        )
+        # align unseen too
+        perm, _, _ = align_topics(phi_true, phi_hat)
+        W_unseen_aligned = W_unseen[:, perm]
 
-    # Topic drift (mean per-topic norms)
-    met_u["l1_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_u_aligned, ord=1, axis=1)))
-    met_u["l2_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_u_aligned, ord=2, axis=1)))
-    met_a["l1_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_a_aligned, ord=1, axis=1)))
-    met_a["l2_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_a_aligned, ord=2, axis=1)))
+        # topic drift norms (mean across topics)
+        met["l1_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_hat_aligned, ord=1, axis=1)))
+        met["l2_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_hat_aligned, ord=2, axis=1)))
 
-    lda_results = {
-        "unaug_full": met_u,
-        "aug_full":   met_a,
-    }
+        lda_results[bucket] = met
+        W_all_aligned_by_bucket[bucket]   = W_all_aligned
+        W_unseen_aligned_by_bucket[bucket] = W_unseen_aligned
 
-    # ---------- Downstream tasks on completely unseen docs ----------
+    # ---------- downstream on unseen; models trained on ALL originals ----------
     results_runs = []
     for rep in range(10):
         beta_reg = rng.normal(0, 1, size=cfg.K)
@@ -522,27 +746,27 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
         y_clf_all    = (sigmoid(logit_all)    > 0.5).astype(int)
         y_clf_unseen = (sigmoid(logit_unseen) > 0.5).astype(int)
 
-        for tag, W_all, W_unseen in [
-            ("unaug_full", W_all_u_aligned, W_unseen_u_aligned),
-            ("aug_full",   W_all_a_aligned, W_unseen_a_aligned),
-        ]:
-            # regression
-            reg_model = Ridge(alpha=1.0, random_state=seed)
-            reg_model.fit(W_all, y_reg_all)
-            y_pred = reg_model.predict(W_unseen)
+        for bucket in ["unaug_full", "aug_full_cp", "aug_full_unfiltered", "aug_full_obs"]:
+            W_all    = W_all_aligned_by_bucket[bucket]
+            W_unseen = W_unseen_aligned_by_bucket[bucket]
+
+            # OLS regression
+            ols = LinearRegression()
+            ols.fit(W_all, y_reg_all)
+            y_pred = ols.predict(W_unseen)
             mse = mean_squared_error(y_reg_unseen, y_pred)
             r2  = r2_score(y_reg_unseen, y_pred)
 
-            # classification
-            clf_model = LogisticRegression(max_iter=1000, random_state=seed)
-            clf_model.fit(W_all, y_clf_all)
-            y_proba = clf_model.predict_proba(W_unseen)[:, 1]
-            y_pred_cls = (y_proba >= 0.5).astype(int)
-            auc = roc_auc_score(y_clf_unseen, y_proba)
-            acc = accuracy_score(y_clf_unseen, y_pred_cls)
+            # Logistic classification
+            clf = LogisticRegression(max_iter=1000, random_state=seed)
+            clf.fit(W_all, y_clf_all)
+            y_prob = clf.predict_proba(W_unseen)[:, 1]
+            y_hat  = (y_prob >= 0.5).astype(int)
+            auc = roc_auc_score(y_clf_unseen, y_prob)
+            acc = accuracy_score(y_clf_unseen, y_hat)
 
             results_runs.append({
-                "bucket": tag,
+                "bucket": bucket,
                 "reg_mse": float(mse), "reg_r2": float(r2),
                 "clf_auc": float(auc), "clf_acc": float(acc),
             })
@@ -551,55 +775,75 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
     downstream_metrics = df.groupby("bucket", sort=False).mean(numeric_only=True).to_dict(orient="index")
     return lda_results, downstream_metrics
 
-
 # ------------------------------
 # Result packaging
 # ------------------------------
-
 def results_to_row(cfg: SynthConfig,
                    res: Dict[str, Any],
                    lda_results: Dict[str, Any],
                    downstream_metrics: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
+    # --- config & selection metrics (unchanged) ---
     row = {
-        # --- config ---
         "V": cfg.V, "K": cfg.K, "beta": cfg.beta, "alpha": cfg.alpha,
         "n_docs": cfg.n_docs, "S": cfg.S, "L": cfg.L, "mask_frac": cfg.mask_frac,
         "Kgen": cfg.Kgen, "delta": cfg.delta, "epsilon": cfg.epsilon, "T": cfg.T,
         "lambda_obs": cfg.lambda_obs, "rho": cfg.rho, "alpha_cp": cfg.alpha_cp,
         "n_train_docs": cfg.n_train_docs, "n_calib_docs": cfg.n_calib_docs, "n_aug_docs": cfg.n_aug_docs,
         "seed": cfg.seed,
-        # --- conditional selection metrics ---
-        "cond_miscoverage": res["conditional"]["metrics"]["miscoverage"],
-        "cond_accept_rate": res["conditional"]["metrics"]["accept_rate"],
-        "cond_distinct_1":  res["conditional"]["metrics"]["distinct_1"],
-        "cond_jsd_drift":   res["conditional"]["metrics"]["jsd_drift"],
-        # --- baselines ---
+
+        # CP selection metrics
+        "CP_miscoverage": res["conditional"]["metrics"]["miscoverage"],
+        "CP_accept_rate": res["conditional"]["metrics"]["accept_rate"],
+        "CP_distinct_1":  res["conditional"]["metrics"]["distinct_1"],
+        "CP_jsd_drift":   res["conditional"]["metrics"]["jsd_drift"],  # renamed for consistency
+
+        # Baseline selection metrics
         "base_unf_miscoverage": res["baselines"]["unfiltered"]["miscoverage"],
         "base_unf_accept_rate": res["baselines"]["unfiltered"]["accept_rate"],
         "base_obs_miscoverage": res["baselines"]["observed_filter"]["miscoverage"],
         "base_obs_accept_rate": res["baselines"]["observed_filter"]["accept_rate"],
     }
 
-    # Add new full-corpus buckets
-    for bucket in ["unaug_full", "aug_full"]:
-        if bucket in lda_results:
-            row[f"topic_jsd_{bucket}"] = float(lda_results[bucket]["phi_mean_jsd"])
-            row[f"topic_cos_{bucket}"] = float(lda_results[bucket]["phi_mean_cos"])
-            row[f"theta_l1_{bucket}"]  = float(lda_results[bucket]["theta_l1_mean"])
-            row[f"theta_l2_{bucket}"]  = float(lda_results[bucket]["theta_l2_mean"])
-            # topic drift norms if present
-            if "l1_drift_topic" in lda_results[bucket]:
-                row[f"phi_l1_{bucket}"] = float(lda_results[bucket]["l1_drift_topic"])
-            if "l2_drift_topic" in lda_results[bucket]:
-                row[f"phi_l2_{bucket}"] = float(lda_results[bucket]["l2_drift_topic"])
+    # --- full-corpus LDA / downstream buckets ---
+    # Canonical names we want to report:
+    desired_buckets = [
+        ("unaug_full",          "unaug_full"),
+        ("aug_full_cp",         "aug_full_cp"),          # CP-selected augmentations
+        ("aug_full_unfiltered", "aug_full_unfiltered"),  # ALL augmentations
+        ("aug_full_obs",        "aug_full_obs"),         # L_obs-filtered augmentations
+    ]
+    # Backward-compat: if caller only produced "aug_full", treat it as CP-selected
+    if ("aug_full_cp" not in lda_results and "aug_full_cp" not in downstream_metrics
+        and ("aug_full" in lda_results or "aug_full" in downstream_metrics)):
+        lda_results.setdefault("aug_full_cp", lda_results.get("aug_full", {}))
+        downstream_metrics.setdefault("aug_full_cp", downstream_metrics.get("aug_full", {}))
 
-        if bucket in downstream_metrics:
-            row[f"reg_mse_{bucket}"] = float(downstream_metrics[bucket]["reg_mse"])
-            row[f"reg_r2_{bucket}"]  = float(downstream_metrics[bucket]["reg_r2"])
-            row[f"clf_auc_{bucket}"] = float(downstream_metrics[bucket]["clf_auc"])
-            row[f"clf_acc_{bucket}"] = float(downstream_metrics[bucket]["clf_acc"])
+    for key, tag in desired_buckets:
+        # topic/theta recovery (if present)
+        if key in lda_results:
+            lr = lda_results[key]
+            if "phi_mean_jsd" in lr: row[f"topic_jsd_{tag}"] = float(lr["phi_mean_jsd"])
+            if "phi_mean_cos" in lr: row[f"topic_cos_{tag}"] = float(lr["phi_mean_cos"])
+            if "theta_l1_mean" in lr: row[f"theta_l1_{tag}"] = float(lr["theta_l1_mean"])
+            if "theta_l2_mean" in lr: row[f"theta_l2_{tag}"] = float(lr["theta_l2_mean"])
+            if "l1_drift_topic" in lr: row[f"phi_l1_{tag}"] = float(lr["l1_drift_topic"])
+            if "l2_drift_topic" in lr: row[f"phi_l2_{tag}"] = float(lr["l2_drift_topic"])
+            # If you added corpus diversity metrics there, record them too:
+            for extra in ("div_entropy", "div_effN", "div_type_token", "dup_rate"):
+                if extra in lr:
+                    row[f"{extra}_{tag}"] = float(lr[extra])
+
+        # downstream (if present)
+        if key in downstream_metrics:
+            dm = downstream_metrics[key]
+            # keys depend on whether you used OLS or Ridge; both expose mse/r2
+            if "reg_mse" in dm: row[f"reg_mse_{tag}"] = float(dm["reg_mse"])
+            if "reg_r2"  in dm: row[f"reg_r2_{tag}"]  = float(dm["reg_r2"])
+            if "clf_auc" in dm: row[f"clf_auc_{tag}"] = float(dm["clf_auc"])
+            if "clf_acc" in dm: row[f"clf_acc_{tag}"] = float(dm["clf_acc"])
 
     return row
+
 
 
 # ------------------------------
