@@ -539,6 +539,7 @@ def evaluate_selected_doclevel(selected_by_doc: Dict[int, List[Unit]],
     X_aug_docs_only = tokens_to_dtm(aug_tokens, phi.shape[1])
     W_aug_docs = lda_a.transform(X_aug_docs_only)  # (n_aug_docs, K)
     # We already computed 'perm_a' above when aligning phi_a; reuse it:
+    perm_a, _, _ = align_topics(phi, phi_a)
     W_aug_docs_aligned = W_aug_docs[:, perm_a]
 
     W_full_with_aug = np.vstack([W_all_a_aligned, W_aug_docs_aligned])
