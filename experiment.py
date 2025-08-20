@@ -642,6 +642,11 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
     # Ensure eval units have A_obs/A_hat already (run_synthetic_experiment should have done this)
     eval_units_all = [u for u in aug_units if u.doc_idx in set(idx_aug)]
     eval_units_obs = [u for u in eval_units_all if not np.isnan(u.A_obs_doc) and u.A_obs_doc >= float(cfg.lambda_obs)]
+    # Marginal-CP-selected eval units saved by run_synthetic_experiment
+    sel_by_doc_eval_marg = res.get("marginal_cp", {}).get("selected_by_doc", {})
+    eval_units_marg = [u for lst in sel_by_doc_eval_marg.values() for u in lst]
+
+
 
     # CP-selected eval units come from the saved selection
     sel_by_doc_eval = res["conditional"]["selected_by_doc"]
@@ -685,6 +690,7 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
         "aug_full_cp":         orig_all_tokens + units_to_docs(eval_units_cp + extra_cp_units),
         "aug_full_unfiltered": orig_all_tokens + units_to_docs(eval_units_all),
         "aug_full_obs":        orig_all_tokens + units_to_docs(eval_units_obs),
+        "aug_full_marginal":   orig_all_tokens + units_to_docs(eval_units_marg),  # NEW
     }
 
     X_train_by_bucket = {k: tokens_to_dtm(v, V) for k, v in corpora_train.items()}
@@ -747,7 +753,7 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
         y_clf_all    = (sigmoid(logit_all)    > 0.5).astype(int)
         y_clf_unseen = (sigmoid(logit_unseen) > 0.5).astype(int)
 
-        for bucket in ["unaug_full", "aug_full_cp", "aug_full_unfiltered", "aug_full_obs"]:
+        for bucket in ["unaug_full", "aug_full_cp", "aug_full_unfiltered", "aug_full_obs", "aug_full_marginal"]:
             W_all    = W_all_aligned_by_bucket[bucket]
             W_unseen = W_unseen_aligned_by_bucket[bucket]
 
@@ -803,7 +809,15 @@ def results_to_row(cfg: SynthConfig,
         "base_unf_accept_rate": res["baselines"]["unfiltered"]["accept_rate"],
         "base_obs_miscoverage": res["baselines"]["observed_filter"]["miscoverage"],
         "base_obs_accept_rate": res["baselines"]["observed_filter"]["accept_rate"],
+        
     }
+    row.update({
+    "Marg_miscoverage": res.get("marginal_cp", {}).get("metrics", {}).get("miscoverage", np.nan),
+    "Marg_accept_rate": res.get("marginal_cp", {}).get("metrics", {}).get("accept_rate", np.nan),
+    "Marg_distinct_1":  res.get("marginal_cp", {}).get("metrics", {}).get("distinct_1", np.nan),
+    "Marg_jsd_drift":   res.get("marginal_cp", {}).get("metrics", {}).get("jsd_drift", np.nan),
+   })
+    
 
     # --- full-corpus LDA / downstream buckets ---
     # Canonical names we want to report:
@@ -812,6 +826,7 @@ def results_to_row(cfg: SynthConfig,
         ("aug_full_cp",         "aug_full_cp"),          # CP-selected augmentations
         ("aug_full_unfiltered", "aug_full_unfiltered"),  # ALL augmentations
         ("aug_full_obs",        "aug_full_obs"),         # L_obs-filtered augmentations
+         ("aug_full_marginal",   "aug_full_marginal"),      # Marginal CP-selected augmentations
     ]
     # Backward-compat: if caller only produced "aug_full", treat it as CP-selected
     if ("aug_full_cp" not in lda_results and "aug_full_cp" not in downstream_metrics
@@ -979,6 +994,35 @@ def run_synthetic_experiment(cfg: SynthConfig,
         seed=cfg.seed,
     )
 
+    try:
+        s_global_marginal = global_threshold_S_doclevel(
+            calib_units,
+            lambda_obs=cfg.lambda_obs,
+            alpha_cp=cfg.alpha_cp,
+            rho=cfg.rho,          # keep if your helper supports doc-level rho; otherwise remove
+        )
+    except TypeError:
+        # fallback if your helper doesn't take rho
+        s_global_marginal = global_threshold_S_doclevel(
+            calib_units,
+            lambda_obs=cfg.lambda_obs,
+            alpha_cp=cfg.alpha_cp,
+        )
+
+    selected_marginal_by_doc: Dict[int, List[Unit]] = {}
+    for u in eval_units:  # only select on the eval set
+        if float(u.A_hat) >= float(s_global_marginal):
+            selected_marginal_by_doc.setdefault(u.doc_idx, []).append(u)
+
+    marginal_metrics = evaluate_selected_doclevel(
+        selected_marginal_by_doc,
+        doc_total_eval,
+        phi,
+        lambda_obs=cfg.lambda_obs,
+        rho=cfg.rho,
+        full_corpus_lda=True,   # keep this False to avoid passing docs/splits here
+    )
+
     # Pretty print
     n_sel = sum(len(v) for v in selected_by_doc.values())
     n_tot = sum(doc_total_eval.values())
@@ -1007,6 +1051,11 @@ def run_synthetic_experiment(cfg: SynthConfig,
             "selected_units": selected_units,
             "metrics": cc_metrics,
         },
+         "marginal_cp": {
+        "threshold": float(s_global_marginal),
+        "selected_by_doc": selected_marginal_by_doc,
+        "metrics": marginal_metrics,
+       },
         "baselines": {
             "unfiltered": baseline_unfiltered,
             "observed_filter": baseline_observed,
