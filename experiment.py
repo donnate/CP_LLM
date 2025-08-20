@@ -950,8 +950,17 @@ def run_synthetic_experiment(cfg: SynthConfig,
         selected_unfiltered_by_doc.setdefault(u.doc_idx, []).append(u)
 
     baseline_unfiltered = evaluate_selected_doclevel(
-        selected_unfiltered_by_doc, doc_total_eval, phi, cfg.lambda_obs, cfg.rho
+        selected_unfiltered_by_doc,
+        doc_total_eval,
+        phi,
+        cfg.lambda_obs,
+        cfg.rho,
+        full_corpus_lda=True,
+        docs=docs,
+        splits={"idx_train": idx_train, "idx_calib": idx_calib, "idx_aug": idx_aug},
+        seed=cfg.seed,
     )
+
 
     selected_observed_by_doc: Dict[int, List[Unit]] = {}
     for u in eval_units:
@@ -959,7 +968,15 @@ def run_synthetic_experiment(cfg: SynthConfig,
             selected_observed_by_doc.setdefault(u.doc_idx, []).append(u)
 
     baseline_observed = evaluate_selected_doclevel(
-        selected_observed_by_doc, doc_total_eval, phi, cfg.lambda_obs, cfg.rho
+        selected_observed_by_doc,
+        doc_total_eval,
+        phi,
+        cfg.lambda_obs,
+        cfg.rho,
+        full_corpus_lda=True,
+        docs=docs,
+        splits={"idx_train": idx_train, "idx_calib": idx_calib, "idx_aug": idx_aug},
+        seed=cfg.seed,
     )
 
     # Pretty print
