@@ -150,9 +150,9 @@ def assemble_feature_label_arrays_doclevel(units: List[Unit],
                          for c in u.candidates]
         u.A_star_doc = float(np.mean(oracle_scores)) if oracle_scores else 0.0
 
-        # >>> pass phi & u.doc_theta so topic-alignment features are active
+        # Do not pass phi & u.doc_theta so topic-alignment features are inactive
         x = featurize_candidate_doclevel(u.masked_true, u.candidates, u.doc_ctx, idf,
-                                         phi=phi, doc_theta=u.doc_theta)
+                                         phi=None, doc_theta=None)
         feats.append(x)
         labels.append(u.A_star_doc if target == "oracle" else u.A_obs_doc)
         idx.append(u.doc_idx)
