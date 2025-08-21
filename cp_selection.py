@@ -51,6 +51,7 @@ def per_doc_S_doclevel_multi(units_for_doc: List[Unit],
     m = len(bad_scores)
     if m <= rho:
         return -np.inf
+    bad_scores = [u.A_hat for u in units_for_doc ]
     bad_scores.sort(reverse=True)
     return float(bad_scores[rho])  # (rho+1)-th largest
 
@@ -129,7 +130,7 @@ def fit_conditional_threshold_doclevel(
     rho: int,                        # allowed bad accepts per doc
     gamma_grid: np.ndarray = np.logspace(-2, 1, 6),  # 0.01..10
     lam_grid:   np.ndarray = np.logspace(-4, 1, 6),  # 1e-4..10
-    use_bad_only: bool = False,       # train CC on BAD-doc scores only (recommended)
+    use_bad_only: bool = False,       # train CC on BAD-doc scores only
     verbose: bool = True,
 ) -> Tuple[Optional[Any], Dict[int, float], Dict[int, List[Any]], List[Any]]:
     """
@@ -207,13 +208,14 @@ def fit_conditional_threshold_doclevel(
         idxs = idxs_by_doc_c.get(d, [])
         if not idxs:
             continue
-        yhat_d = yhat_c[idxs]
+        yhat_d = yhat_c[idxs]   #### y observed
         bad_d  = (yobs_c[idxs] < float(lambda_obs))
         n_bad  = int(np.sum(bad_d))
         if n_bad <= rho:
             S_d = -np.inf
         else:
-            svals = np.sort(yhat_d[bad_d])        # ascending
+            #svals = np.sort(yhat_d[bad_d])        # ascending
+            svals = np.sort(yhat_d)  
             S_d = float(svals[-(rho+1)])          # (ρ+1)-th largest
         X_doc_c.append(theta_by_doc[d])
         S_doc_c.append(S_d)
