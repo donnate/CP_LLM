@@ -907,6 +907,8 @@ def run_synthetic_experiment(cfg: SynthConfig,
     reg = RandomForestRegressor(n_estimators=300, max_depth=None, random_state=cfg.seed, n_jobs=-1)
     reg.fit(X_train, y_train)
 
+
+
     # Compute correlations on calib (for monitoring)
     calib_units = [u for u in aug_units if u.doc_idx in set(idx_calib)]
     X_calib, y_calib, _ = assemble_feature_label_arrays_doclevel(
@@ -994,25 +996,25 @@ def run_synthetic_experiment(cfg: SynthConfig,
         seed=cfg.seed,
     )
 
-    try:
-        s_global_marginal = global_threshold_S_doclevel(
-            calib_units,
-            lambda_obs=cfg.lambda_obs,
-            alpha_cp=cfg.alpha_cp,
-            rho=cfg.rho,          # keep if your helper supports doc-level rho; otherwise remove
-        )
-    except TypeError:
-        # fallback if your helper doesn't take rho
-        s_global_marginal = global_threshold_S_doclevel(
-            calib_units,
-            lambda_obs=cfg.lambda_obs,
-            alpha_cp=cfg.alpha_cp,
-        )
+    # Build {doc_idx -> list of units} for CALIB
+    calib_by_doc: Dict[int, List[Unit]] = {}
+    for u in calib_units:
+        calib_by_doc.setdefault(u.doc_idx, []).append(u)
 
+    # Marginal CP threshold
+    s_global_marginal = global_threshold_S_doclevel(
+        calib_by_doc,
+        lambda_obs=cfg.lambda_obs,
+        rho=cfg.rho,
+        alpha_cp=cfg.alpha_cp,
+    )
+
+    # Select on EVAL using the single global threshold
     selected_marginal_by_doc: Dict[int, List[Unit]] = {}
-    for u in eval_units:  # only select on the eval set
+    for u in eval_units:
         if float(u.A_hat) >= float(s_global_marginal):
             selected_marginal_by_doc.setdefault(u.doc_idx, []).append(u)
+
 
     marginal_metrics = evaluate_selected_doclevel(
         selected_marginal_by_doc,
@@ -1021,6 +1023,9 @@ def run_synthetic_experiment(cfg: SynthConfig,
         lambda_obs=cfg.lambda_obs,
         rho=cfg.rho,
         full_corpus_lda=True,   # keep this False to avoid passing docs/splits here
+        docs=docs,
+        splits={"idx_train": idx_train, "idx_calib": idx_calib, "idx_aug": idx_aug},
+        seed=cfg.seed,
     )
 
     # Pretty print
