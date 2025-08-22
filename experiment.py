@@ -84,7 +84,13 @@ def predict_for_units_doclevel(units: List[Unit],
                                oracle_mode: str = "cosine",
                                as_log: bool = False) -> None:
     """
-    Compute features (also sets A_obs_doc / A_star_doc) and write A_hat back to each Unit.
+    Compute features (also sets A_obs_doc / A_star_doc via side-effects in the featurizer if implemented)
+    and write A_hat back to each Unit from a fitted regressor.
+
+    NOTE: Use target="obs" here to get predictions for observed-score.
+          Do NOT call this with target="oracle" to avoid overwriting A_hat.
+          If you need oracle labels materialized on Units, call the featurizer directly
+          (see comment in run_synthetic_experiment).
     """
     X, _, _ = assemble_feature_label_arrays_doclevel(
         units, idf, phi, target=target, oracle_mode=oracle_mode, as_log=as_log
@@ -110,10 +116,12 @@ def expected_theta_from_tokens(tokens: List[int],
     K, V = phi.shape
     if prior is None:
         prior = np.ones(K, dtype=np.float64) / K
-    prior = prior / prior.sum()
+    prior = prior / (prior.sum() + 1e-20)
 
     counts = np.zeros(K, dtype=np.float64)
     for w in tokens:
+        if w < 0 or w >= V:
+            continue  # OOV guard
         pw = phi[:, w] + 1e-20
         post = pw * prior
         s = post.sum()
@@ -135,7 +143,7 @@ def tokens_to_dtm(docs_tokens: List[List[int]], V: int) -> csr_matrix:
     """CSR doc-term matrix from list of token-id lists."""
     indptr, indices, data = [0], [], []
     for toks in docs_tokens:
-        cnt = Counter(toks)
+        cnt = Counter(t for t in toks if 0 <= t < V)  # OOV guard
         if cnt:
             k, v = zip(*cnt.items())
             indices.extend(k)
@@ -152,8 +160,10 @@ def unit_to_aug_tokens(u: Unit) -> List[int]:
     Keep this consistent with LDA training and similarity computation.
     """
     toks: List[int] = []
-    for s in u.doc_ctx: toks.extend(s)
-    for s in u.candidates: toks.extend(s)
+    for s in u.doc_ctx:
+        toks.extend(s)
+    for s in u.candidates:
+        toks.extend(s)
     return toks
 
 def original_tokens_for(docs: List[Document], idxs: Optional[np.ndarray] = None) -> List[List[int]]:
@@ -193,21 +203,20 @@ def fit_lda_and_transform_many(X_train: csr_matrix,
     return lda, phi_hat, W_list
 
 def align_topics(phi_true: np.ndarray, phi_hat: np.ndarray) -> Tuple[np.ndarray, float, float]:
-    """Align phi_hat to phi_true via Hungarian on JSD; return (perm, mean_jsd, mean_cos)."""
+    """
+    Align phi_hat to phi_true via Hungarian on L1 divergence.
+    Returns (perm, mean_jsd, mean_cosine).
+    """
     K = phi_true.shape[0]
-    D = np.zeros((K, K), dtype=np.float64)
-    C = np.zeros((K, K), dtype=np.float64)
+    D = np.zeros((K, K), dtype=np.float64)  # JSD cost
+    C = np.zeros((K, K), dtype=np.float64)  # cosine sim
     for i in range(K):
         pi = phi_true[i] / (phi_true[i].sum() + 1e-12)
         for j in range(K):
             pj = phi_hat[j] / (phi_hat[j].sum() + 1e-12)
-            m = 0.5 * (pi + pj)
-            def _kl(a, b):
-                mask = a > 0
-                return float((a[mask] * (np.log(a[mask] / (b[mask] + 1e-20) + 1e-20))).sum())
-            js = 0.5 * _kl(pi, m) + 0.5 * _kl(pj, m)
-            D[i, j] = js / np.log(2.0)
-            C[i, j] = float(np.dot(pi, pj) / (np.linalg.norm(pi) * np.linalg.norm(pj) + 1e-20))
+            D[i, j] =  np.linalg.norm(pi - pj, ord=1)   #js_divergence(pi, pj)  # uses your helper (ln or log2; consistent across runs)
+            C[i, j] = float(np.dot(pi, pj) /
+                            ((np.linalg.norm(pi) * np.linalg.norm(pj)) + 1e-20))
     r, c = linear_sum_assignment(D)
     return c, float(D[r, c].mean()), float(C[r, c].mean())
 
@@ -232,7 +241,7 @@ def _align_and_doc_theta_metrics(phi_true: np.ndarray,
 
 
 # ------------------------------
-# Diversity metrics
+# Diversity & structure metrics (optional helpers)
 # ------------------------------
 
 def _corpus_ngram_set(token_lists: List[List[int]], n: int = 1) -> set:
@@ -252,29 +261,6 @@ def _distinct_n(token_lists: List[List[int]], n: int = 1) -> float:
         return 0.0
     S = _corpus_ngram_set(token_lists, n=n)
     return len(S) / float(total)
-
-def _lexical_diversity_metrics(orig_tokens: List[List[int]],
-                               aug_tokens:  List[List[int]]) -> Dict[str, float]:
-    d1_o = _distinct_n(orig_tokens, n=1)
-    d2_o = _distinct_n(orig_tokens, n=2)
-    d1_a = _distinct_n(orig_tokens + aug_tokens, n=1)
-    d2_a = _distinct_n(orig_tokens + aug_tokens, n=2)
-
-    Uo1 = _corpus_ngram_set(orig_tokens, n=1)
-    Ua1 = _corpus_ngram_set(orig_tokens + aug_tokens, n=1)
-    Uo2 = _corpus_ngram_set(orig_tokens, n=2)
-    Ua2 = _corpus_ngram_set(orig_tokens + aug_tokens, n=2)
-
-    new_vocab_frac = 0.0 if len(Ua1) == 0 else len(Ua1 - Uo1) / float(len(Ua1))
-    jacc1 = 0.0 if (len(Uo1|Ua1) == 0) else len(Uo1 & Ua1) / float(len(Uo1 | Ua1))
-    jacc2 = 0.0 if (len(Uo2|Ua2) == 0) else len(Uo2 & Ua2) / float(len(Uo2 | Ua2))
-
-    return {
-        "distinct1_unaug": d1_o, "distinct2_unaug": d2_o,
-        "distinct1_with_aug": d1_a, "distinct2_with_aug": d2_a,
-        "new_vocab_frac": new_vocab_frac,
-        "jaccard_unigram": jacc1, "jaccard_bigram": jacc2,
-    }
 
 def _row_l2_normalize_dense(X: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
@@ -330,18 +316,6 @@ def _random_projection_enp_and_dups(X_csr: csr_matrix,
     dup = _dup_rate_from_dense_unit_rows(Z, tau=tau_dup, block=block)
     return enp, dup
 
-def _effective_num_points_topic(W: np.ndarray, block: int = 8192) -> float:
-    if W.size == 0:
-        return 0.0
-    Z = _row_l2_normalize_dense(W)
-    return _effective_num_points_from_dense_unit_rows(Z, block=block)
-
-def _dup_rate_topic(W: np.ndarray, tau: float = 0.95, block: int = 8192) -> float:
-    if W.size == 0:
-        return 0.0
-    Z = _row_l2_normalize_dense(W)
-    return _dup_rate_from_dense_unit_rows(Z, tau=tau, block=block)
-
 
 # ------------------------------
 # Selection metrics (fast)
@@ -380,15 +354,15 @@ def evaluate_selected_doclevel(selected_by_doc: Dict[int, List[Unit]],
         accepted = selected_by_doc.get(doc_idx, [])
         accepted_total += len(accepted)
         total_units += int(tot)
-        bad_accepts = sum(1 for u in accepted if float(u.A_obs_doc) < float(lambda_obs))
+        bad_accepts = sum(1 for u in accepted if float(getattr(u, "A_obs_doc", -1.0)) < float(lambda_obs))
         if bad_accepts > rho:
             miscover_cnt += 1
 
         if accepted:
             # distinct-1 over generated sentences only
             for u in accepted:
-                for sent in u.candidates:
-                    all_accepted_tokens.extend(sent)
+                for s in u.candidates:
+                    all_accepted_tokens.extend(s)
 
             # doc-level drift: compare θ(orig) vs θ(aug=ctx+all gens)
             u0 = accepted[0]
@@ -415,7 +389,7 @@ def evaluate_selected_doclevel(selected_by_doc: Dict[int, List[Unit]],
 
 
 # ------------------------------
-# Similarity helpers (aug vs original)
+# Similarity helpers (aug/orig vs orig/expected)
 # ------------------------------
 
 def _cosine_from_token_lists(a_tokens: List[int], b_tokens: List[int]) -> float:
@@ -427,28 +401,136 @@ def _cosine_from_token_lists(a_tokens: List[int], b_tokens: List[int]) -> float:
     dot = sum(ca[k] * cb.get(k, 0) for k in ca.keys())
     return dot / (na * nb)
 
+def _counts_from_tokens(tokens, V: int, token_to_id: Optional[Dict]=None) -> np.ndarray:
+    """
+    Build a length-V count vector from a token list.
+    - If tokens are ints in [0, V), uses bincount.
+    - If tokens are strings (or other), provide token_to_id.
+    """
+    if len(tokens) == 0:
+        return np.zeros(V, dtype=np.float64)
+
+    # Fast path: integer ids
+    if isinstance(tokens[0], (int, np.integer)) and token_to_id is None:
+        arr = np.fromiter((t for t in tokens if 0 <= t < V), dtype=np.int64)
+        if arr.size == 0:
+            return np.zeros(V, dtype=np.float64)
+        return np.bincount(arr, minlength=V).astype(np.float64)
+
+    # Mapping path: strings or custom tokens
+    if token_to_id is None:
+        raise ValueError("token_to_id mapping required for non-integer tokens.")
+    counts = np.zeros(V, dtype=np.float64)
+    for tok in tokens:
+        i = token_to_id.get(tok, None)
+        if i is not None and 0 <= i < V:
+            counts[i] += 1.0
+    return counts
+
+def _cosine_dense_dense(a: np.ndarray, b: np.ndarray) -> float:
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+def _cosine_from_token_list_vs_expected(tokens, expected_probs: np.ndarray,
+                                        token_to_id: Optional[Dict]=None) -> float:
+    """
+    Cosine between a token bag (as counts) and a dense expected vector (probabilities).
+    Scale is irrelevant for cosine; using raw counts vs probabilities is fine.
+    """
+    V = expected_probs.shape[0]
+    counts = _counts_from_tokens(tokens, V, token_to_id=token_to_id)
+    return _cosine_dense_dense(counts, expected_probs)
+
 def _summarize_aug_similarities(units: List[Unit],
-                                docs: List[Document]) -> Dict[str, float]:
+                                docs: List[Document],
+                                *,
+                                phi: Optional[np.ndarray] = None,               # (K, V)
+                                theta_by_doc: Optional[np.ndarray] = None,     # (n_docs, K)
+                                token_to_id: Optional[Dict] = None) -> Dict[str, float]:
     """
     Cosine(units_as_full_doc, original_full_doc) for each Unit.
-    Full doc = (context + generated) for consistency with LDA.
+    Also (optional) cosine to the underlying expected word distribution p_doc = theta_doc @ phi.
+
+    Returns dict with original cosine stats + added keys:
+      - cosine_aug_exp_* (aug vs expected)
+      - cosine_orig_exp_* (orig vs expected)
+      (present only if phi & theta_by_doc are provided)
     """
     if not units:
-        return {"n_added": 0, "cosine_mean": 0.0, "cosine_median": 0.0,
-                "cosine_p10": 0.0, "cosine_p90": 0.0}
-    sims = []
+        out = {"n_added": 0,
+               "cosine_mean": np.nan, "cosine_median": np.nan,
+               "cosine_p10": np.nan, "cosine_p90": np.nan}
+        if phi is not None and theta_by_doc is not None:
+            out.update({
+                "cosine_aug_exp_mean": np.nan, "cosine_aug_exp_median": np.nan,
+                "cosine_aug_exp_p10": np.nan,  "cosine_aug_exp_p90": np.nan,
+                "cosine_orig_exp_mean": np.nan, "cosine_orig_exp_median": np.nan,
+                "cosine_orig_exp_p10": np.nan,  "cosine_orig_exp_p90": np.nan,
+            })
+        return out
+
+    # --- original full-doc cosine (aug vs orig) ---
+    sims_aug_vs_orig = []
     for u in units:
         aug = unit_to_aug_tokens(u)
         orig = [tok for s in docs[u.doc_idx].sentences for tok in s]
-        sims.append(_cosine_from_token_lists(aug, orig))
-    arr = np.asarray(sims, dtype=np.float64)
-    return {
+        sims_aug_vs_orig.append(_cosine_from_token_lists(aug, orig))
+    arr = np.asarray(sims_aug_vs_orig, dtype=np.float64)
+
+    out = {
         "n_added": len(units),
         "cosine_mean": float(arr.mean()),
         "cosine_median": float(np.median(arr)),
         "cosine_p10": float(np.percentile(arr, 10)),
         "cosine_p90": float(np.percentile(arr, 90)),
     }
+
+    # --- optional: similarities to expected distribution phi^T theta_doc ---
+    if phi is not None and theta_by_doc is not None:
+        K, V = phi.shape
+        exp_cache: Dict[int, np.ndarray] = {}
+
+        def expected_for_doc(doc_idx: int) -> np.ndarray:
+            v = exp_cache.get(doc_idx)
+            if v is None:
+                theta = theta_by_doc[doc_idx]              # shape (K,)
+                v = np.dot(theta, phi)                     # shape (V,)
+                v = np.maximum(v, 0.0)
+                s = v.sum()
+                if s > 0:
+                    v = v / s
+                exp_cache[doc_idx] = v
+            return v
+
+        sims_aug_vs_exp = []
+        sims_orig_vs_exp = []
+
+        for u in units:
+            exp_vec = expected_for_doc(u.doc_idx)          # (V,)
+            aug = unit_to_aug_tokens(u)
+            orig = [tok for s in docs[u.doc_idx].sentences for tok in s]
+
+            sims_aug_vs_exp.append(_cosine_from_token_list_vs_expected(aug, exp_vec, token_to_id))
+            sims_orig_vs_exp.append(_cosine_from_token_list_vs_expected(orig, exp_vec, token_to_id))
+
+        arr_ae = np.asarray(sims_aug_vs_exp, dtype=np.float64)
+        arr_oe = np.asarray(sims_orig_vs_exp, dtype=np.float64)
+
+        out.update({
+            "cosine_aug_exp_mean": float(arr_ae.mean()),
+            "cosine_aug_exp_median": float(np.median(arr_ae)),
+            "cosine_aug_exp_p10": float(np.percentile(arr_ae, 10)),
+            "cosine_aug_exp_p90": float(np.percentile(arr_ae, 90)),
+            "cosine_orig_exp_mean": float(arr_oe.mean()),
+            "cosine_orig_exp_median": float(np.median(arr_oe)),
+            "cosine_orig_exp_p10": float(np.percentile(arr_oe, 10)),
+            "cosine_orig_exp_p90": float(np.percentile(arr_oe, 90)),
+        })
+
+    return out
 
 
 # ------------------------------
@@ -472,6 +554,7 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
       - 'aug_full_unfiltered' : originals + all eval augmentations
       - 'aug_full_obs'        : originals + eval augmentations with A_obs >= lambda
       - 'aug_full_marginal'   : originals + marginal-CP-selected eval augmentations
+      - 'aug_full_oracle'     : originals + eval augmentations with A_star >= lambda
     """
     rng = np.random.default_rng(seed + 202)
 
@@ -492,52 +575,50 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
     # augmentation pools (EVAL)
     eval_units_all = [u for u in aug_units if u.doc_idx in set(idx_aug)]
     eval_units_obs = [u for u in eval_units_all
-                      if not np.isnan(u.A_obs_doc) and u.A_obs_doc >= float(cfg.lambda_obs)]
+                      if getattr(u, "A_obs_doc", None) is not None
+                      and not np.isnan(u.A_obs_doc)
+                      and u.A_obs_doc >= float(cfg.lambda_obs)]
+
+    # Oracle bucket (EVAL): use A_star_doc if present
+    eval_units_oracle = [u for u in eval_units_all
+                         if getattr(u, "A_star_doc", None) is not None
+                         and not np.isnan(u.A_star_doc)
+                         and u.A_star_doc >= float(cfg.lambda_obs)]
 
     # CP-selected (EVAL)
     sel_by_doc_eval = res["conditional"]["selected_by_doc"]
     eval_units_cp = [u for lst in sel_by_doc_eval.values() for u in lst]
 
-    # (Optional) add TRAIN/CALIB CP-selected to CP bucket
-    extra_cp_units: List[Unit] = []
-    if include_train_aug or include_calib_aug:
-        train_units_all = [u for u in aug_units if u.doc_idx in set(idx_train)]
-        calib_units_all = [u for u in aug_units if u.doc_idx in set(idx_calib)]
-        if any(np.isnan(getattr(u, "A_hat", np.nan)) or np.isnan(getattr(u, "A_obs_doc", np.nan))
-               for u in (train_units_all + calib_units_all)):
-            predict_for_units_doclevel(train_units_all + calib_units_all,
-                                       res["reg"], res["idf"], res["phi"], target="obs")
-
-        # if include_train_aug:
-        #     cc_train = fit_conditional_threshold_doclevel(
-        #         calib_units=calib_units_all, test_units=train_units_all,
-        #         idf=res["idf"], phi=res["phi"],
-        #         lambda_obs=cfg.lambda_obs, alpha_cp=cfg.alpha_cp, rho=cfg.rho, verbose=False
-        #     )
-        #     _, _, _, sel_train_units = cc_train
-        #     extra_cp_units.extend(sel_train_units)
-
-        # if include_calib_aug:
-        #     cc_calib = fit_conditional_threshold_doclevel(
-        #         calib_units=calib_units_all, test_units=calib_units_all,
-        #         idf=res["idf"], phi=res["phi"],
-        #         lambda_obs=cfg.lambda_obs, alpha_cp=cfg.alpha_cp, rho=cfg.rho, verbose=False
-        #     )
-        #     _, _, _, sel_calib_units = cc_calib
-        #     extra_cp_units.extend(sel_calib_units)
-
     # Marginal-CP-selected (EVAL)
     sel_by_doc_eval_marg = res.get("marginal_cp", {}).get("selected_by_doc", {})
     eval_units_marg = [u for lst in sel_by_doc_eval_marg.values() for u in lst]
 
-    # Similarity stats for buckets
+    # Similarity stats for buckets (including vs expected)
+    theta_by_doc_eval = np.stack([np.asarray(d.theta, dtype=float) for d in docs], axis=0)
+
     simstats_by_bucket = {
-        "unaug_full":          {"n_added": 0, "cosine_mean": 0.0, "cosine_median": 0.0,
-                                "cosine_p10": 0.0, "cosine_p90": 0.0},
-        "aug_full_cp":         _summarize_aug_similarities(eval_units_cp, docs),
-        "aug_full_unfiltered": _summarize_aug_similarities(eval_units_all, docs),
-        "aug_full_obs":        _summarize_aug_similarities(eval_units_obs, docs),
-        "aug_full_marginal":   _summarize_aug_similarities(eval_units_marg, docs),
+        "unaug_full": {
+            "n_added": 0,
+            "cosine_mean": np.nan,
+            "cosine_median": np.nan,
+            "cosine_p10": np.nan,
+            "cosine_p90": np.nan,
+        },
+        "aug_full_cp": _summarize_aug_similarities(
+            units=eval_units_cp, docs=docs, phi=phi_true, theta_by_doc=theta_by_doc_eval
+        ),
+        "aug_full_unfiltered": _summarize_aug_similarities(
+            units=eval_units_all, docs=docs, phi=phi_true, theta_by_doc=theta_by_doc_eval
+        ),
+        "aug_full_obs": _summarize_aug_similarities(
+            units=eval_units_obs, docs=docs, phi=phi_true, theta_by_doc=theta_by_doc_eval
+        ),
+        "aug_full_marginal": _summarize_aug_similarities(
+            units=eval_units_marg, docs=docs, phi=phi_true, theta_by_doc=theta_by_doc_eval
+        ),
+        "aug_full_oracle": _summarize_aug_similarities(
+            units=eval_units_oracle, docs=docs, phi=phi_true, theta_by_doc=theta_by_doc_eval
+        ),
     }
 
     # training corpora for each bucket
@@ -550,6 +631,7 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
         "aug_full_unfiltered": orig_all_tokens + units_to_docs(eval_units_all),
         "aug_full_obs":        orig_all_tokens + units_to_docs(eval_units_obs),
         "aug_full_marginal":   orig_all_tokens + units_to_docs(eval_units_marg),
+        "aug_full_oracle":     orig_all_tokens + units_to_docs(eval_units_oracle),
     }
     X_train_by_bucket = {k: tokens_to_dtm(v, V) for k, v in corpora_train.items()}
 
@@ -583,16 +665,20 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
             phi_true=phi_true, phi_hat=phi_hat, W_docs=W_all, Theta_true=Theta_all_true
         )
 
-        # Add similarity counts/statistics
+        # Attach similarity stats (including new expected-cosine keys)
         ss = simstats_by_bucket.get(bucket)
         if ss is not None:
             met["n_aug_added"]          = int(ss["n_added"])
-            met["aug2orig_cosine_mean"] = float(ss["cosine_mean"])
-            met["aug2orig_cosine_med"]  = float(ss["cosine_median"])
-            met["aug2orig_cosine_p10"]  = float(ss["cosine_p10"])
-            met["aug2orig_cosine_p90"]  = float(ss["cosine_p90"])
+            met["aug2orig_cosine_mean"] = float(ss["cosine_mean"]) if ss["cosine_mean"] == ss["cosine_mean"] else np.nan
+            met["aug2orig_cosine_med"]  = float(ss["cosine_median"]) if ss["cosine_median"] == ss["cosine_median"] else np.nan
+            met["aug2orig_cosine_p10"]  = float(ss["cosine_p10"]) if ss["cosine_p10"] == ss["cosine_p10"] else np.nan
+            met["aug2orig_cosine_p90"]  = float(ss["cosine_p90"]) if ss["cosine_p90"] == ss["cosine_p90"] else np.nan
+            # expected-cosine (optional; present for augmented buckets)
+            if "cosine_aug_exp_mean" in ss:
+                met["aug2exp_cosine_mean"] = float(ss["cosine_aug_exp_mean"])
+                met["orig2exp_cosine_mean"] = float(ss["cosine_orig_exp_mean"])
 
-        # align unseen as well
+        # align unseen as well (reuse the same permutation)
         perm, _, _ = align_topics(phi_true, phi_hat)
         W_unseen_aligned = W_unseen[:, perm]
 
@@ -620,7 +706,7 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
         y_clf_all    = (sigmoid(logit_all)    > 0.5).astype(int)
         y_clf_unseen = (sigmoid(logit_unseen) > 0.5).astype(int)
 
-        for bucket in ["unaug_full", "aug_full_cp", "aug_full_unfiltered", "aug_full_obs", "aug_full_marginal"]:
+        for bucket in ["unaug_full", "aug_full_cp", "aug_full_unfiltered", "aug_full_obs", "aug_full_marginal", "aug_full_oracle"]:
             W_all    = W_all_aligned_by_bucket[bucket]
             W_unseen = W_unseen_aligned_by_bucket[bucket]
 
@@ -684,6 +770,8 @@ def results_to_row(cfg: SynthConfig,
         "base_unf_accept_rate": res["baselines"]["unfiltered"]["accept_rate"],
         "base_obs_miscoverage": res["baselines"]["observed_filter"]["miscoverage"],
         "base_obs_accept_rate": res["baselines"]["observed_filter"]["accept_rate"],
+        "base_oracle_miscoverage": res.get("baselines", {}).get("oracle_filter", {}).get("miscoverage", np.nan),
+        "base_oracle_accept_rate": res.get("baselines", {}).get("oracle_filter", {}).get("accept_rate", np.nan),
     }
 
     # marginal CP selection metrics
@@ -694,7 +782,7 @@ def results_to_row(cfg: SynthConfig,
         "Marg_jsd_drift":   res.get("marginal_cp", {}).get("metrics", {}).get("jsd_drift", np.nan),
     })
 
-    # similarity summaries (what we actually add during selection on eval)
+    # similarity summaries for what we add on EVAL
     sim_cp  = res.get("conditional", {}).get("additions_summary", {})
     if sim_cp:
         row["n_added_cp"] = int(sim_cp["n_added"])
@@ -713,11 +801,11 @@ def results_to_row(cfg: SynthConfig,
         row["cosine_mean_obs"] = float(sim_obs["cosine_mean"])
         row["cosine_med_obs"]  = float(sim_obs["cosine_median"])
 
-    sim_marg = res.get("marginal_cp", {}).get("additions_summary", {})
-    if sim_marg:
-        row["n_added_marg"] = int(sim_marg["n_added"])
-        row["cosine_mean_marg"] = float(sim_marg["cosine_mean"])
-        row["cosine_med_marg"]  = float(sim_marg["cosine_median"])
+    sim_oracle = res.get("baselines", {}).get("oracle_filter", {}).get("additions_summary", {})
+    if sim_oracle:
+        row["n_added_oracle"] = int(sim_oracle["n_added"])
+        row["cosine_mean_oracle"] = float(sim_oracle["cosine_mean"])
+        row["cosine_med_oracle"]  = float(sim_oracle["cosine_median"])
 
     # full-corpus LDA / downstream buckets (ensure consistent keys)
     desired_buckets = [
@@ -725,6 +813,7 @@ def results_to_row(cfg: SynthConfig,
         ("aug_full_cp",         "aug_full_cp"),
         ("aug_full_unfiltered", "aug_full_unfiltered"),
         ("aug_full_obs",        "aug_full_obs"),
+        ("aug_full_oracle",     "aug_full_oracle"),
         ("aug_full_marginal",   "aug_full_marginal"),
     ]
 
@@ -746,6 +835,9 @@ def results_to_row(cfg: SynthConfig,
             if "n_aug_added" in lr:           row[f"n_added_{tag}"] = int(lr["n_aug_added"])
             if "aug2orig_cosine_mean" in lr:  row[f"cosine_mean_{tag}"] = float(lr["aug2orig_cosine_mean"])
             if "aug2orig_cosine_med" in lr:   row[f"cosine_med_{tag}"]  = float(lr["aug2orig_cosine_med"])
+            # optional: expose expected-cosine summaries
+            if "aug2exp_cosine_mean" in lr:   row[f"aug2exp_cos_{tag}"] = float(lr["aug2exp_cosine_mean"])
+            if "orig2exp_cosine_mean" in lr:  row[f"orig2exp_cos_{tag}"] = float(lr["orig2exp_cosine_mean"])
 
         if key in downstream_metrics:
             dm = downstream_metrics[key]
@@ -791,10 +883,10 @@ def run_synthetic_experiment(cfg: SynthConfig,
     base_units, base_by_doc, all_sents = build_units(cfg, docs, phi, rng)
     aug_units, aug_docs = assemble_augmented_docs_and_units(docs, base_by_doc, cfg.Kgen)
 
-    # 4) IDF
+    # 4) IDF  (NOTE: you may consider using TRAIN-only to avoid leakage)
     idf = compute_idf(all_sents, cfg.V)
 
-    # 5) Train regressor on TRAIN augmented docs
+    # 5) Train regressor on TRAIN augmented docs (target=observed)
     train_units = [u for u in aug_units if u.doc_idx in set(idx_train)]
     X_train, y_train, _ = assemble_feature_label_arrays_doclevel(
         train_units, idf, phi, target=target_for_reg, oracle_mode="cosine", as_log=False
@@ -810,7 +902,7 @@ def run_synthetic_experiment(cfg: SynthConfig,
     _, y_calib_oracle, _ = assemble_feature_label_arrays_doclevel(
         calib_units, idf, phi, target="oracle", oracle_mode="cosine", as_log=False
     )
-    pred_c = reg.predict(X_calib)
+    pred_c = reg.predict(X_calib) if X_calib.shape[0] > 0 else np.array([])
     corr_calib_ahat   = float(np.corrcoef(pred_c, y_calib)[0, 1]) if X_calib.shape[0] > 1 else np.nan
     corr_calib_oracle = float(np.corrcoef(pred_c, y_calib_oracle)[0, 1]) if X_calib.shape[0] > 1 else np.nan
     r2_calib          = r2_score(y_calib, pred_c) if X_calib.shape[0] > 1 else np.nan
@@ -818,11 +910,18 @@ def run_synthetic_experiment(cfg: SynthConfig,
     if verbose:
         print(f"[MON] corr(pred, A_obs) calib={corr_calib_ahat:.3f} | corr(pred, A_star) calib={corr_calib_oracle:.3f}")
 
-    # Predict A_hat for TRAIN/CALIB/EVAL
+    # Predict A_hat for TRAIN/CALIB/EVAL (observed target)
     eval_units  = [u for u in aug_units if u.doc_idx in set(idx_aug)]
     predict_for_units_doclevel(train_units, reg, idf, phi, target="obs")
     predict_for_units_doclevel(calib_units, reg, idf, phi, target="obs")
     predict_for_units_doclevel(eval_units,  reg, idf, phi, target="obs")
+
+    # If your featurizer writes A_star_doc when target="oracle", materialize it once (side-effects),
+    # without touching A_hat. If not, you can skip this; oracle buckets will then be empty unless
+    # A_star_doc is set elsewhere.
+    _ = assemble_feature_label_arrays_doclevel(
+        train_units + calib_units + eval_units, idf, phi, target="oracle", oracle_mode="cosine", as_log=False
+    )
 
     # 6) Conditional thresholds (fit on calib, apply to eval)
     if verbose:
@@ -859,10 +958,18 @@ def run_synthetic_experiment(cfg: SynthConfig,
 
     selected_observed_by_doc: Dict[int, List[Unit]] = {}
     for u in eval_units:
-        if not np.isnan(u.A_obs_doc) and float(u.A_obs_doc) >= float(cfg.lambda_obs):
+        if getattr(u, "A_obs_doc", None) is not None and not np.isnan(u.A_obs_doc) and u.A_obs_doc >= float(cfg.lambda_obs):
             selected_observed_by_doc.setdefault(u.doc_idx, []).append(u)
     baseline_observed = evaluate_selected_doclevel(
         selected_observed_by_doc, doc_total_eval, phi, cfg.lambda_obs, cfg.rho, full_corpus_lda=False
+    )
+
+    selected_oracle_by_doc: Dict[int, List[Unit]] = {}
+    for u in eval_units:
+        if getattr(u, "A_star_doc", None) is not None and not np.isnan(u.A_star_doc) and u.A_star_doc >= float(cfg.lambda_obs):
+            selected_oracle_by_doc.setdefault(u.doc_idx, []).append(u)
+    baseline_oracle = evaluate_selected_doclevel(
+        selected_oracle_by_doc, doc_total_eval, phi, cfg.lambda_obs, cfg.rho, full_corpus_lda=False
     )
 
     # Marginal CP (global threshold): build calib_by_doc dict first
@@ -876,7 +983,7 @@ def run_synthetic_experiment(cfg: SynthConfig,
 
     selected_marginal_by_doc: Dict[int, List[Unit]] = {}
     for u in eval_units:
-        if float(u.A_hat) >= float(s_global_marginal):
+        if float(getattr(u, "A_hat", -np.inf)) >= float(s_global_marginal):
             selected_marginal_by_doc.setdefault(u.doc_idx, []).append(u)
 
     marginal_metrics = evaluate_selected_doclevel(
@@ -885,15 +992,18 @@ def run_synthetic_experiment(cfg: SynthConfig,
     )
 
     # additions / similarity summaries for what we add on EVAL
-    eval_units_cp   = [u for lst in selected_by_doc.values() for u in lst]
-    eval_units_all  = eval_units[:]  # all generated for eval docs
-    eval_units_obs  = [u for u in eval_units if not np.isnan(u.A_obs_doc) and u.A_obs_doc >= float(cfg.lambda_obs)]
-    eval_units_marg = [u for lst in selected_marginal_by_doc.values() for u in lst]
+    eval_units_cp     = [u for lst in selected_by_doc.values() for u in lst]
+    eval_units_all    = eval_units[:]  # all generated for eval docs
+    eval_units_obs    = [u for u in eval_units if getattr(u, "A_obs_doc", None) is not None and not np.isnan(u.A_obs_doc) and u.A_obs_doc >= float(cfg.lambda_obs)]
+    eval_units_oracle = [u for u in eval_units if getattr(u, "A_star_doc", None) is not None and not np.isnan(u.A_star_doc) and u.A_star_doc >= float(cfg.lambda_obs)]
+    eval_units_marg   = [u for lst in selected_marginal_by_doc.values() for u in lst]
 
-    sim_cp   = _summarize_aug_similarities(eval_units_cp, docs)
-    sim_unf  = _summarize_aug_similarities(eval_units_all, docs)
-    sim_obs  = _summarize_aug_similarities(eval_units_obs, docs)
-    sim_marg = _summarize_aug_similarities(eval_units_marg, docs)
+    theta_by_doc_all = np.stack([np.asarray(d.theta, dtype=float) for d in docs], axis=0)
+    sim_cp     = _summarize_aug_similarities(eval_units_cp, docs, phi=phi, theta_by_doc=theta_by_doc_all)
+    sim_unf    = _summarize_aug_similarities(eval_units_all, docs, phi=phi, theta_by_doc=theta_by_doc_all)
+    sim_obs    = _summarize_aug_similarities(eval_units_obs, docs, phi=phi, theta_by_doc=theta_by_doc_all)
+    sim_oracle = _summarize_aug_similarities(eval_units_oracle, docs, phi=phi, theta_by_doc=theta_by_doc_all)
+    sim_marg   = _summarize_aug_similarities(eval_units_marg, docs, phi=phi, theta_by_doc=theta_by_doc_all)
 
     if verbose:
         n_sel = sum(len(v) for v in selected_by_doc.values())
@@ -902,6 +1012,7 @@ def run_synthetic_experiment(cfg: SynthConfig,
         print(f"[CC] Metrics (conditional): {cc_metrics}")
         print(f"[BASE] Unfiltered: {baseline_unfiltered}")
         print(f"[BASE] Observed  : {baseline_observed}")
+        print(f"[BASE] Oracle    : {baseline_oracle}")
         print(f"[MARG] Metrics   : {marginal_metrics}")
 
     results = {
@@ -936,8 +1047,9 @@ def run_synthetic_experiment(cfg: SynthConfig,
             "additions_summary": sim_marg,
         },
         "baselines": {
-            "unfiltered":     {**baseline_unfiltered, "additions_summary": sim_unf},
+            "unfiltered":      {**baseline_unfiltered, "additions_summary": sim_unf},
             "observed_filter": {**baseline_observed,  "additions_summary": sim_obs},
+            "oracle_filter":   {**baseline_oracle,    "additions_summary": sim_oracle},
         }
     }
     return results
