@@ -789,6 +789,12 @@ def results_to_row(cfg: SynthConfig,
         row["cosine_mean_cp"] = float(sim_cp["cosine_mean"])
         row["cosine_med_cp"]  = float(sim_cp["cosine_median"])
 
+    sim_marg  = res.get("marginal_cp", {}).get("additions_summary", {})
+    if sim_cp:
+        row["n_added_marg"] = int(sim_cp["n_added"])
+        row["cosine_mean_marg"] = float(sim_cp["cosine_mean"])
+        row["cosine_med_marg"]  = float(sim_cp["cosine_median"])
+
     sim_unf = res.get("baselines", {}).get("unfiltered", {}).get("additions_summary", {})
     if sim_unf:
         row["n_added_unfiltered"] = int(sim_unf["n_added"])
