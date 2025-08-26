@@ -140,6 +140,88 @@ class LAKCP:
         if self.verbose:
             print(f"[gamma search] best γ={best_gamma:.6g}, λ*={best_lambda:.6g}, CSIC={best_sic:.6g}")
 
+
+    def search_gamma_lambda_CV(self, X, Phi, S, gamma_grid, n_folds = 5,
+                               random_state = 123):
+        """
+        """
+        from sklearn.model_selection import KFold
+
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+
+        opt_lambdas = []   # (n_gamma,)
+        opt_valid_err = [] # (n_gamma,)
+        opt_test_err = []  # (n_gamma,)
+        opt_test_fit = []  # (n_gamma, n_test)
+        opt_train_fit = [] # (n_gamma, n_train)
+        opt_miscoverage = [] # (n_gamma,)
+        opt_lengths = []     # (n_gamma,)
+
+        tau = 1 - self.alpha
+
+        for gamma in gamma_grid:
+            fold_val_err = []
+            fold_lambdas = []
+            fold_v = []
+            fold_eta = []
+
+            # --- CV loop ---
+            for train_idx, valid_idx in kf.split(S):
+                S_train, S_val = S[train_idx], S[valid_idx]
+                Phi_train, Phi_val = Phi[train_idx, :], Phi[valid_idx, :]
+                X_train, X_val = X[train_idx, :], X[valid_idx, :]
+
+                # fit path
+                K_train = kernel(X_train, X_train, gamma)
+                res = lambda_path(S_train.ravel(), Phi_train, K_train, self.alpha,
+                                max_steps=200, tol=1e-3, thres=10.0, verbose=False)
+
+                # validation fit
+                K_val = kernel(X_val, X_train, gamma)
+                fit_val = Phi_val @ res['eta_arr'].T + (K_val @ res['v_arr'].T)/res['lambdas'][None, :]
+
+                # quantile loss
+                diff = S_val[:, None] - fit_val
+                val_loss = np.where(diff > 0, tau * diff, (tau - 1) * diff)
+                val_err = np.mean(val_loss, axis=0)
+
+                # best lambda in this fold
+                opt = np.argmin(val_err)
+                fold_val_err.append(val_err[opt])
+                fold_lambdas.append(res['lambdas'][opt])
+                fold_v.append(res['v_arr'][opt, :])
+                fold_eta.append(res['eta_arr'][opt, :])
+
+            # --- aggregate across folds ---
+            mean_val_err = np.mean(fold_val_err)
+            best_fold = np.argmin(fold_val_err)
+
+            opt_valid_err.append(mean_val_err)
+            opt_lambdas.append(fold_lambdas[best_fold])
+            opt_v = fold_v[best_fold]
+            opt_eta = fold_eta[best_fold]
+
+            # retrain on all data with chosen lambda/gamma if needed
+            K_full = kernel(X, X, gamma)
+            res_full = lambda_path(S.ravel(), Phi, K_full, self.alpha,
+                                max_steps=200, tol=1e-3, thres=10.0, verbose=False)
+            # choose lambda closest to fold choice
+            idx = np.argmin(np.abs(res_full['lambdas'] - opt_lambdas[-1]))
+            opt_train_fit.append(res_full['fit'][idx, :])
+
+        # choose best gamma by CV error
+        opt_idx = np.argmin(opt_valid_err)
+        best_gamma = gamma_grid[opt_idx]
+        best_lambda = opt_lambdas[opt_idx]
+        return {
+            'best_gamma': best_gamma,
+            'best_lambda': best_lambda,
+            'opt_idx': opt_idx,
+            'opt_valid_err': opt_valid_err,
+            'opt_train_fit': opt_train_fit,
+            'opt_lambdas': opt_lambdas,
+        }
+
     # -------------------------------------------------
     # Stage 2: compute S_opt for each test point (S_path)
     # -------------------------------------------------
