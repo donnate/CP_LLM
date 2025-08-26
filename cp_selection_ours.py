@@ -259,8 +259,10 @@ def fit_conditional_threshold_doclevel(
                                 gamma = None,
                                 gamma_grid = np.logspace(-4,2,15),
                                 verbose=False)
-    
-    lakcp.search_gamma_lambda(X_cc_fit, Phi_cal, S_doc_c.ravel())
+
+    lakcp.search_gamma_lambda_CV(X=X_cc_fit, Phi=Phi_cal,S= S_doc_c.ravel(),
+                                 gamma_grid= np.logspace(-4,2,15),
+                                 n_folds = 10)
     print("LAKCP finished choosing lambda and gamma.")
 
     # -- Predict thresholds per **test doc** and select units
