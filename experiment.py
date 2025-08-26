@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+
+
+
+
 import os
 import math
 import random
@@ -29,10 +33,10 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--exp_name', type=str, default="debug")
 parser.add_argument('--seed', type=int, default=42)
-parser.add_argument('--n_train', type=int, default=100)
-parser.add_argument('--n_calib', type=int, default=100)
+parser.add_argument('--n_train', type=int, default=50)
+parser.add_argument('--n_calib', type=int, default=50)
 parser.add_argument('--temp', type=float, default=1.0)
-parser.add_argument('--delta', type=float, default=0.1)
+parser.add_argument('--delta', type=float, default=5.0)
 parser.add_argument('--epsilon', type=float, default=0.5)
 args = parser.parse_args()
 
@@ -378,6 +382,7 @@ def evaluate_selected_doclevel(selected_by_doc: Dict[int, List[Unit]],
             l1_vals.append(np.linalg.norm(orig_theta - aug_theta, ord=1))
 
     base = {
+        "n_accepted": accepted_total,
         "miscoverage": miscover_cnt / max(1, n_docs),
         "accept_rate": accepted_total / max(1, total_units),
         "distinct_1": distinct_1(all_accepted_tokens),
@@ -1067,18 +1072,19 @@ def run_synthetic_experiment(cfg: SynthConfig,
 if __name__ == "__main__":
     os.makedirs("results", exist_ok=True)
     results_df = pd.DataFrame()
+    temp = 2.0
 
     for alpha_cp in [0.05, 0.1, 0.2]:
         cfg = SynthConfig(
             V=1000, K=3, beta=0.1, alpha=0.3,
-            n_docs=n_train + n_calib + 500, S=10, L=12, mask_frac=0.5, Kgen=20,
+            n_docs=n_train + n_calib + 50, S=10, L=12, mask_frac=0.5, Kgen=20,
             delta=delta, epsilon=epsilon, T=temp,
             lambda_obs=0.01, rho=10, alpha_cp=alpha_cp,
             n_train_docs=n_train, n_calib_docs=n_calib, n_aug_docs=500,
             seed=SEED
         )
-        for lambda_obs in [0.05, 0.1, 0.25, 0.35]:
-            for rho in [0, 1, 2, 5, 10]:
+        for lambda_obs in [0.05, 0.01, 0.005, 0.1, 0.25]:
+            for rho in [2, 0, 5, 10]:
                 cfg.rho = rho
                 cfg.alpha_cp = alpha_cp
                 cfg.lambda_obs = lambda_obs

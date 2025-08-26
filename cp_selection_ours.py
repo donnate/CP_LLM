@@ -13,8 +13,8 @@ from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.model_selection import KFold
 
 
-from LatentKernCP_.lakcp import LAKCP
-from LatentKernCP_.utils import *
+from LatentKernCP.lakcp import LAKCP
+from LatentKernCP.utils import *
 from unit import Unit, assemble_feature_label_arrays_doclevel  # Assuming Unit is defined in a module named 'unit'
 
 # ------------------------------
@@ -32,7 +32,7 @@ def per_doc_S_doclevel(u: Unit, lambda_obs: float, rho: int) -> float:
     if u.A_obs_doc < lambda_obs:
         return u.A_hat
     else:
-        return -np.inf
+        return -1#np.inf
     
 def per_doc_S_doclevel_multi(units_for_doc: List[Unit],
                              lambda_obs: float,
@@ -51,7 +51,7 @@ def per_doc_S_doclevel_multi(units_for_doc: List[Unit],
     bad_scores = [u.A_hat for u in units_for_doc if u.A_obs_doc < lambda_obs ]
     m = len(bad_scores)
     if m <= rho:
-        return -np.inf
+        return -1#np.inf
     bad_scores = [u.A_hat for u in units_for_doc ]
     bad_scores.sort(reverse=True)
     return float(bad_scores[rho])  # (rho+1)-th largest
@@ -71,7 +71,7 @@ def global_threshold_S_doclevel(units_by_doc: Dict[int, List[Unit]],
     S_vals = np.asarray(S_vals, dtype=np.float64)
     n = len(S_vals)
     if n == 0:
-        return -np.inf
+        return -1#np.inf
     # finite-sample corrected (n+1) quantile at 1-alpha
     q_idx = int(math.ceil((n + 1) * (1 - alpha_cp)))
     q_idx = min(max(1, q_idx), n)
@@ -204,7 +204,7 @@ def fit_conditional_threshold_doclevel(
         bad_d  = (yobs_c[idxs] < float(lambda_obs))
         n_bad  = int(np.sum(bad_d))
         if n_bad <= rho:
-            S_d = -np.inf
+            S_d = -1 #np.inf
         else:
             #svals = np.sort(yhat_d[bad_d])        # ascending
             svals = np.sort(yhat_d)  
@@ -217,7 +217,7 @@ def fit_conditional_threshold_doclevel(
     S_doc_c = np.array(S_doc_c, dtype=np.float64)
 
     if use_bad_only:
-        bad_doc_mask = np.isfinite(S_doc_c) & (S_doc_c != -np.inf)
+        bad_doc_mask = np.isfinite(S_doc_c) & (S_doc_c != -1)#np.inf)
         X_cc_fit = X_doc_c[bad_doc_mask]
         S_cc_fit = S_doc_c[bad_doc_mask]
     else:
@@ -227,7 +227,7 @@ def fit_conditional_threshold_doclevel(
         X_cc_fit = X_doc_c
 
     if verbose:
-        n_bad_docs = int(np.sum(np.isfinite(S_doc_c) & (S_doc_c != -np.inf)))
+        n_bad_docs = int(np.sum(np.isfinite(S_doc_c) & (S_doc_c != -1)))#np.inf)))
         print(f"[CC-LDA] Calib docs: {len(S_doc_c)} | BAD-docs used for CC: {n_bad_docs} | feat dim={X_doc_c.shape[1]}")
     print(S_doc_c)
     print("std of S_doc_c:", np.std(S_doc_c[np.isfinite(S_doc_c)]))
@@ -243,6 +243,10 @@ def fit_conditional_threshold_doclevel(
 
 
     Phi_cal = phi_fn_intercept(X_cc_fit)
+    print("Fitting LAKCP over grid...")
+    print(Phi_cal.shape)
+    print(X_cc_fit.shape)
+    print(len(yhat_c))
 
     print("Starting LAKCP...")
     lakcp = LAKCP(alpha = alpha_cp,
@@ -254,9 +258,9 @@ def fit_conditional_threshold_doclevel(
                                 start_side = 'left',
                                 gamma = None,
                                 gamma_grid = np.logspace(-4,2,15),
-                                verbose=True)
+                                verbose=False)
     
-    lakcp.search_gamma_lambda(X_cc_fit, Phi_cal, yhat_c.ravel())
+    lakcp.search_gamma_lambda(X_cc_fit, Phi_cal, S_doc_c.ravel())
     print("LAKCP finished choosing lambda and gamma.")
 
     # -- Predict thresholds per **test doc** and select units
@@ -267,7 +271,7 @@ def fit_conditional_threshold_doclevel(
     for d in test_doc_ids:
         x_doc = theta_by_doc[d][None, :]
         Phi_test = phi_fn_intercept(X_cc_fit)
-        pred_set = lakcp.fit(X_cc_fit, Phi_cal, yhat_c.ravel(),
+        pred_set = lakcp.fit(X_cc_fit, Phi_cal, S_doc_c.ravel(),
                             x_doc, Phi_test)
         s_doc = float(np.asarray(pred_set).reshape(-1)[-1])
         thresholds_by_doc[int(d)] = s_doc
@@ -308,4 +312,4 @@ def fit_conditional_threshold_doclevel(
 
     
 
-    return cc, thresholds_by_doc, selected_by_doc, selected_units
+    return lakcp, thresholds_by_doc, selected_by_doc, selected_units
