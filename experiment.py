@@ -56,7 +56,7 @@ from unit import (
 from helper_similarity_metrics import (
     distinct_1, js_divergence
 )
-from cp_selection import (
+from cp_selection_ours import (
     per_doc_S_doclevel, per_doc_S_doclevel_multi, global_threshold_S_doclevel,
     fit_conditional_threshold_doclevel
 )
