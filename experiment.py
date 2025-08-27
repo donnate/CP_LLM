@@ -191,10 +191,11 @@ def fit_lda_and_transform_many(X_train: csr_matrix,
     Fit an LDA on X_train, then .transform() every matrix in X_list_to_transform.
     Returns (lda, phi_hat, [W_0, W_1, ...]) where W_i = transform(X_list_to_transform[i]).
     """
+    V = beta.shape[1]
     lda = LatentDirichletAllocation(
         n_components=K,
-        doc_topic_prior=alpha,
-        topic_word_prior=beta,
+        doc_topic_prior=1.0 / K,
+        topic_word_prior=1.0 / V,
         learning_method="batch",
         max_iter=100,
         random_state=seed,
@@ -1022,7 +1023,7 @@ def run_synthetic_experiment(cfg: SynthConfig,
         print(f"[CC] Selected generations: {n_sel} / {n_tot} ({100.0 * n_sel / max(1, n_tot):.1f}%)")
         print(f"[CC] Metrics (conditional): {cc_metrics}")
         print(f"[BASE] Unfiltered: {baseline_unfiltered}")
-        print(f"[BASE] Observed  : {baseline_observed}")
+        prin:quitt(f"[BASE] Observed  : {baseline_observed}")
         print(f"[BASE] Oracle    : {baseline_oracle}")
         print(f"[MARG] Metrics   : {marginal_metrics}")
 
