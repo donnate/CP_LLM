@@ -542,6 +542,83 @@ def _summarize_aug_similarities(units: List[Unit],
 # ------------------------------
 # Full-corpus LDA + downstream on unseen set
 # ------------------------------
+def theta_aug_oracle_from_unit(u: Unit, phi_true: np.ndarray) -> np.ndarray:
+    """Estimate the 'true' θ for an augmented doc using the oracle φ and its tokens."""
+    prior = u.doc_theta / (u.doc_theta.sum() + 1e-20)  # stabilize EM-style update
+    toks  = unit_to_aug_tokens(u)                      # (context + generated), or use delta-only if you prefer
+    return expected_theta_from_tokens(toks, phi_true, prior=prior)
+
+
+from typing import Dict, List, Tuple
+
+def build_bucket_matrix(
+    orig_all_tokens: List[List[int]],
+    units: List[Unit],
+    V: int,
+    mode: str = "full",   # "full" = context+generated, "delta" = generated only
+) -> Tuple[csr_matrix, List[Tuple[str, int, int]]]:
+    """
+    Returns:
+      Xtr: CSR matrix with rows [originals] + [augmentations]
+      row_meta: list of ("orig", doc_idx, -1) or ("aug", doc_idx, unit_idx_in_list)
+    """
+    def unit_to_delta_tokens(u: Unit) -> List[int]:
+        out = []
+        for s in u.candidates: out.extend(s)
+        return out
+
+    rows: List[List[int]] = []
+    row_meta: List[Tuple[str, int, int]] = []
+
+    # originals first (in idx_all order assumed by caller)
+    for j, toks in enumerate(orig_all_tokens):
+        rows.append(toks)
+        row_meta.append(("orig", j, -1))
+
+    # augmentations in the exact order of `units`
+    for j, u in enumerate(units):
+        toks = unit_to_aug_tokens(u) if mode == "full" else unit_to_delta_tokens(u)
+        rows.append(toks)
+        row_meta.append(("aug", u.doc_idx, j))
+
+    Xtr = tokens_to_dtm_sorted(rows, V)  # uses the sorted version below
+    return Xtr, row_meta
+
+
+from collections import Counter
+import numpy as np
+from scipy.sparse import csr_matrix
+
+def tokens_to_dtm_sorted(docs_tokens: List[List[int]], V: int) -> csr_matrix:
+    """
+    CSR doc-term matrix with per-row sorted column indices.
+    Row order == input list order.
+    """
+    indptr = [0]
+    indices = []
+    data = []
+    for toks in docs_tokens:
+        # OOV guard + counts
+        cnt = Counter(t for t in toks if 0 <= t < V)
+        if cnt:
+            cols, vals = zip(*cnt.items())
+            cols = np.fromiter(cols, dtype=np.int32)
+            vals = np.fromiter(vals, dtype=np.int64)
+            # sort columns
+            order = np.argsort(cols, kind="stable")
+            indices.extend(cols[order].tolist())
+            data.extend(vals[order].tolist())
+        indptr.append(len(indices))
+    X = csr_matrix(
+        (np.asarray(data, dtype=np.float32),
+         np.asarray(indices, dtype=np.int32),
+         np.asarray(indptr, dtype=np.int32)),
+        shape=(len(docs_tokens), V),
+        dtype=np.float32
+    )
+    # X.sort_indices()  # optional; already sorted per row
+    return X
+
 
 def evaluate_lda_and_downstream(cfg: SynthConfig,
                                 res: Dict[str, Any],
@@ -551,7 +628,7 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
                                 include_calib_aug: bool = False
                                 ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
     """
-    LDA on FULL corpora (TRAIN+CALIB+TEST) with five variants and
+    LDA on FULL corpora (TRAIN+CALIB+TEST) with multiple variants and
     downstream evaluation on a NEW unseen synthetic set.
 
     Buckets:
@@ -564,6 +641,9 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
     """
     rng = np.random.default_rng(seed + 202)
 
+    # --------------------
+    # Unpack corpus + splits
+    # --------------------
     phi_true   = res["phi"]
     docs       = res["docs"]
     aug_units  = res["aug_units"]
@@ -572,36 +652,43 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
     idx_aug    = np.asarray(res["splits"]["idx_aug"])
     idx_all    = np.r_[idx_train, idx_calib, idx_aug]
     V          = phi_true.shape[1]
+    K          = phi_true.shape[0]
 
-    # originals
+    # --------------------
+    # Originals (training+calib+eval) as baseline rows
+    # --------------------
     orig_all_tokens = [flatten_doc(docs[i].sentences) for i in idx_all]
     X_all_orig = tokens_to_dtm(orig_all_tokens, V)
-    X_unaug_train = X_all_orig  # for 'unaug_full'
 
-    # augmentation pools (EVAL)
+    # --------------------
+    # Build augmentation pools (EVAL split)
+    # --------------------
     eval_units_all = [u for u in aug_units if u.doc_idx in set(idx_aug)]
     eval_units_obs = [u for u in eval_units_all
                       if getattr(u, "A_obs_doc", None) is not None
                       and not np.isnan(u.A_obs_doc)
-                      and u.A_obs_doc >= float(cfg.lambda_obs)]
-
-    # Oracle bucket (EVAL): use A_star_doc if present
+                      and float(u.A_obs_doc) >= float(cfg.lambda_obs)]
     eval_units_oracle = [u for u in eval_units_all
                          if getattr(u, "A_star_doc", None) is not None
                          and not np.isnan(u.A_star_doc)
-                         and u.A_star_doc >= float(cfg.lambda_obs)]
-
+                         and float(u.A_star_doc) >= float(cfg.lambda_obs)]
     # CP-selected (EVAL)
     sel_by_doc_eval = res["conditional"]["selected_by_doc"]
     eval_units_cp = [u for lst in sel_by_doc_eval.values() for u in lst]
-
     # Marginal-CP-selected (EVAL)
     sel_by_doc_eval_marg = res.get("marginal_cp", {}).get("selected_by_doc", {})
     eval_units_marg = [u for lst in sel_by_doc_eval_marg.values() for u in lst]
 
-    # Similarity stats for buckets (including vs expected)
-    theta_by_doc_eval = np.stack([np.asarray(d.theta, dtype=float) for d in docs], axis=0)
+    # Optional: include train/calib CP units (kept False by default)
+    extra_cp_units: List[Unit] = []
+    if include_train_aug or include_calib_aug:
+        # You can populate extra_cp_units here if desired (left as a no-op by default).
+        pass
 
+    # --------------------
+    # Similarity stats (aug vs orig and aug/orig vs expected φ^Tθ)
+    # --------------------
+    theta_by_doc_eval = np.stack([np.asarray(d.theta, dtype=float) for d in docs], axis=0)
     simstats_by_bucket = {
         "unaug_full": {
             "n_added": 0,
@@ -627,21 +714,36 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
         ),
     }
 
-    # training corpora for each bucket
+    # --------------------
+    # Training corpora per bucket (order matters!)
+    # originals + (units in the exact order below)
+    # --------------------
     def units_to_docs(units: List[Unit]) -> List[List[int]]:
         return [unit_to_aug_tokens(u) for u in units]
 
-    corpora_train = {
-        "unaug_full":          orig_all_tokens,
-        "aug_full_cp":         orig_all_tokens + units_to_docs(eval_units_cp),
-        "aug_full_unfiltered": orig_all_tokens + units_to_docs(eval_units_all),
-        "aug_full_obs":        orig_all_tokens + units_to_docs(eval_units_obs),
-        "aug_full_marginal":   orig_all_tokens + units_to_docs(eval_units_marg),
-        "aug_full_oracle":     orig_all_tokens + units_to_docs(eval_units_oracle),
+    units_by_bucket: Dict[str, List[Unit]] = {
+        "unaug_full":          [],
+        "aug_full_cp":         eval_units_cp + extra_cp_units,
+        "aug_full_unfiltered": eval_units_all,
+        "aug_full_obs":        eval_units_obs,
+        "aug_full_marginal":   eval_units_marg,
+        "aug_full_oracle":     eval_units_oracle,
     }
-    X_train_by_bucket = {k: tokens_to_dtm(v, V) for k, v in corpora_train.items()}
 
-    # new unseen set
+    corpora_train: Dict[str, List[List[int]]] = {
+        b: (orig_all_tokens if b == "unaug_full"
+            else orig_all_tokens + units_to_docs(units_by_bucket[b]))
+        for b in units_by_bucket.keys()
+    }
+    X_train_by_bucket = {k: tokens_to_dtm_sorted(v, V) for k, v in corpora_train.items()}
+
+
+
+
+
+    # --------------------
+    # Unseen dataset for downstream evaluation
+    # --------------------
     cfg_unseen = SynthConfig(
         V=cfg.V, K=cfg.K, beta=cfg.beta, alpha=cfg.alpha,
         n_docs=n_unseen_eval_docs, S=cfg.S, L=cfg.L,
@@ -653,79 +755,170 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
     unseen_docs = generate_corpus(cfg_unseen, phi_true, rng)
     X_unseen_orig = tokens_to_dtm([flatten_doc(d.sentences) for d in unseen_docs], V)
 
+    # Ground-truth thetas for originals + unseen (used for labels/metrics)
     Theta_all_true = np.vstack([docs[i].theta for i in idx_all])
     Theta_unseen   = np.vstack([d.theta for d in unseen_docs])
 
-    # fit one LDA per bucket; compute topic/theta recovery
+    # --------------------
+    # Fit one LDA per bucket; transform and align (Xtr, X_all, X_unseen)
+    # --------------------
     lda_results: Dict[str, Dict[str, float]] = {}
+
+    W_tr_aligned_by_bucket: Dict[str, np.ndarray]     = {}
     W_all_aligned_by_bucket: Dict[str, np.ndarray]    = {}
     W_unseen_aligned_by_bucket: Dict[str, np.ndarray] = {}
 
+    # helper: oracle θ for an augmented Unit (context+generated)
+    def theta_aug_oracle_from_unit(u: Unit) -> np.ndarray:
+        prior = u.doc_theta / (u.doc_theta.sum() + 1e-20)
+        toks  = unit_to_aug_tokens(u)  # use delta-only if you prefer to avoid context
+        return expected_theta_from_tokens(toks, phi_true, prior=prior)
+
     for bucket, Xtr in X_train_by_bucket.items():
-        lda, phi_hat, [W_all, W_unseen] = fit_lda_and_transform_many(
+        # Transform ALL three matrices so rows line up:
+        # W_tr:   rows = originals (idx_all) + augmented units (in units_by_bucket[bucket] order)
+        # W_all:  rows = originals only (idx_all)
+        # W_unseen: rows = unseen originals
+        units = units_by_bucket[bucket]
+        n_orig = len(orig_all_tokens)
+        n_aug = len(units)
+        assert Xtr.shape[0] == n_orig + n_aug, "Row mismatch: Xtr != originals + augmentations"
+
+
+
+
+        lda, phi_hat, [W_tr, W_all, W_unseen] = fit_lda_and_transform_many(
             X_train=Xtr,
-            X_list_to_transform=[X_all_orig, X_unseen_orig],
+            X_list_to_transform=[Xtr, X_all_orig, X_unseen_orig],
             K=cfg.K, alpha=cfg.alpha, beta=cfg.beta, seed=seed
         )
-        met, phi_hat_aligned, W_all_aligned = _align_and_doc_theta_metrics(
-            phi_true=phi_true, phi_hat=phi_hat, W_docs=W_all, Theta_true=Theta_all_true
-        )
 
-        # Attach similarity stats (including new expected-cosine keys)
+        # Align topics by Hungarian; perm is reused across all matrices
+        perm, mean_jsd, mean_cos = align_topics(phi_true, phi_hat)
+        phi_hat_aligned = phi_hat[perm]
+        W_tr_aligned    = W_tr[:, perm]
+        W_all_aligned   = W_all[:, perm]
+        W_unseen_aligned= W_unseen[:, perm]
+
+        # Doc-theta recovery on ORIGINAL docs only (aligned)
+        theta_l1 = float(np.mean(np.linalg.norm(W_all_aligned - Theta_all_true, ord=1, axis=1)))
+        theta_l2 = float(np.mean(np.linalg.norm(W_all_aligned - Theta_all_true, ord=2, axis=1)))
+
+        # Topic drift (aligned)
+        phi_l1 = float(np.mean(np.linalg.norm(phi_true - phi_hat_aligned, ord=1, axis=1)))
+        phi_l2 = float(np.mean(np.linalg.norm(phi_true - phi_hat_aligned, ord=2, axis=1)))
+
+        met = {
+            "phi_mean_jsd": mean_jsd,
+            "phi_mean_cos": mean_cos,
+            "theta_l1_mean": theta_l1,
+            "theta_l2_mean": theta_l2,
+            "l1_drift_topic": phi_l1,
+            "l2_drift_topic": phi_l2,
+        }
+
+        # Attach similarity stats (including expected-cosine when present)
         ss = simstats_by_bucket.get(bucket)
         if ss is not None:
             met["n_aug_added"]          = int(ss["n_added"])
-            met["aug2orig_cosine_mean"] = float(ss["cosine_mean"]) if ss["cosine_mean"] == ss["cosine_mean"] else np.nan
-            met["aug2orig_cosine_med"]  = float(ss["cosine_median"]) if ss["cosine_median"] == ss["cosine_median"] else np.nan
-            met["aug2orig_cosine_p10"]  = float(ss["cosine_p10"]) if ss["cosine_p10"] == ss["cosine_p10"] else np.nan
-            met["aug2orig_cosine_p90"]  = float(ss["cosine_p90"]) if ss["cosine_p90"] == ss["cosine_p90"] else np.nan
-            # expected-cosine (optional; present for augmented buckets)
+            met["aug2orig_cosine_mean"] = float(ss["cosine_mean"])
+            met["aug2orig_cosine_med"]  = float(ss["cosine_median"])
+            met["aug2orig_cosine_p10"]  = float(ss["cosine_p10"])
+            met["aug2orig_cosine_p90"]  = float(ss["cosine_p90"])
             if "cosine_aug_exp_mean" in ss:
-                met["aug2exp_cosine_mean"] = float(ss["cosine_aug_exp_mean"])
+                met["aug2exp_cosine_mean"]  = float(ss["cosine_aug_exp_mean"])
                 met["orig2exp_cosine_mean"] = float(ss["cosine_orig_exp_mean"])
 
-        # align unseen as well (reuse the same permutation)
-        perm, _, _ = align_topics(phi_true, phi_hat)
-        W_unseen_aligned = W_unseen[:, perm]
-
-        # topic drift norms (mean across topics)
-        met["l1_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_hat_aligned, ord=1, axis=1)))
-        met["l2_drift_topic"] = float(np.mean(np.linalg.norm(phi_true - phi_hat_aligned, ord=2, axis=1)))
-
         lda_results[bucket] = met
-        W_all_aligned_by_bucket[bucket]     = W_all_aligned
-        W_unseen_aligned_by_bucket[bucket]  = W_unseen_aligned
+        W_tr_aligned_by_bucket[bucket]     = W_tr_aligned
+        W_all_aligned_by_bucket[bucket]    = W_all_aligned
+        W_unseen_aligned_by_bucket[bucket] = W_unseen_aligned
 
-    # downstream on unseen; models trained on ALL originals (for each bucket's LDA space)
+    # --------------------
+    # Downstream: train on AUGMENTED training rows (W_tr) and eval on unseen (W_unseen)
+    # Labels for augmented rows:
+    #   - label_mode="oracle": recompute θ for augmented doc from tokens + φ_true, then generate labels
+    #   - label_mode="inherit": use the original doc's label (+ noise for regression)
+    # --------------------
+    label_mode = "inherit"  # set to "inherit" to switch behavior
+
+    # Precompute mapping for "inherit"
+    pos_in_all = {doc_idx: j for j, doc_idx in enumerate(idx_all)}
+
+    # Build oracle θ for augmented rows (once per bucket)
+    Theta_true_tr_by_bucket: Dict[str, np.ndarray] = {}
+    sample_weight_by_bucket: Dict[str, np.ndarray] = {}
+    doc_counts_by_bucket: Dict[str, Dict[int, int]] = {}
+
+    for bucket, units in units_by_bucket.items():
+        # True θ for training rows: originals first, then augmented units (in order)
+        theta_list = [Theta_all_true]
+        for u in units:
+            theta_list.append(theta_aug_oracle_from_unit(u))
+        Theta_true_tr = np.vstack(theta_list)
+        Theta_true_tr_by_bucket[bucket] = Theta_true_tr
+
+        # # Per-doc counts for sample weights (to avoid over-weighting docs with many clones)
+        # counts = {int(d): 1 for d in idx_all}
+        # for u in units:
+        #     counts[u.doc_idx] = counts.get(u.doc_idx, 1) + 1
+        # doc_counts_by_bucket[bucket] = counts
+
+        # # Sample weight: each original doc gets total weight ~1 across its (1+clones)
+        # weights = [1.0 / counts[idx_all[i]] for i in range(len(idx_all))]
+        # weights.extend([1.0 / counts[u.doc_idx] for u in units])
+        # sample_weight_by_bucket[bucket] = np.asarray(weights, dtype=np.float64)
+
+    # Run multiple stochastic label draws
     results_runs = []
     for rep in range(10):
-        beta_reg = rng.normal(0, 1, size=cfg.K)
-        beta_clf = rng.normal(0, 1, size=cfg.K)
+        beta_reg = rng.normal(0, 1, size=K)
+        beta_clf = rng.normal(0, 1, size=K)
+
         def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
 
-        # outcomes from true thetas
-        y_reg_all    = Theta_all_true @ beta_reg + rng.normal(0, 0.1, size=Theta_all_true.shape[0])
-        y_reg_unseen = Theta_unseen   @ beta_reg + rng.normal(0, 0.1, size=Theta_unseen.shape[0])
-
-        logit_all    = Theta_all_true @ beta_clf + rng.normal(0, 0.5, size=Theta_all_true.shape[0])
-        logit_unseen = Theta_unseen   @ beta_clf + rng.normal(0, 0.5, size=Theta_unseen.shape[0])
-        y_clf_all    = (sigmoid(logit_all)    > 0.5).astype(int)
+        # Build UNSEEN labels from true θ
+        y_reg_unseen = Theta_unseen @ beta_reg + rng.normal(0, 0.1, size=Theta_unseen.shape[0])
+        logit_unseen = Theta_unseen @ beta_clf + rng.normal(0, 0.5, size=Theta_unseen.shape[0])
         y_clf_unseen = (sigmoid(logit_unseen) > 0.5).astype(int)
 
+        # For each bucket train on W_tr (augmented rows) with chosen label mode
         for bucket in ["unaug_full", "aug_full_cp", "aug_full_unfiltered", "aug_full_obs", "aug_full_marginal", "aug_full_oracle"]:
-            W_all    = W_all_aligned_by_bucket[bucket]
+            W_tr     = W_tr_aligned_by_bucket[bucket]
             W_unseen = W_unseen_aligned_by_bucket[bucket]
+            units    = units_by_bucket[bucket]
+            Theta_tr = Theta_true_tr_by_bucket[bucket]
+            #sw_tr    = sample_weight_by_bucket[bucket]
 
-            # OLS regression
+            n_orig = len(idx_all)
+            # Build training labels
+            if label_mode == "oracle":
+                y_reg_tr = Theta_tr @ beta_reg + rng.normal(0, 0.1, size=Theta_tr.shape[0])
+                logit_tr = Theta_tr @ beta_clf + rng.normal(0, 0.5, size=Theta_tr.shape[0])
+                y_clf_tr = (sigmoid(logit_tr) > 0.5).astype(int)
+            elif label_mode == "inherit":
+                # Originals
+                y_reg_all = Theta_all_true @ beta_reg + rng.normal(0, 0.1, size=Theta_all_true.shape[0])
+                logit_all = Theta_all_true @ beta_clf + rng.normal(0, 0.5, size=Theta_all_true.shape[0])
+                y_clf_all = (sigmoid(logit_all) > 0.5).astype(int)
+                # Augmented rows inherit per-doc label (add tiny noise for regression)
+                y_reg_aug = np.array([y_reg_all[pos_in_all[u.doc_idx]] + rng.normal(0, 0.01) for u in units], dtype=float)
+                y_clf_aug = np.array([y_clf_all[pos_in_all[u.doc_idx]] for u in units], dtype=int)
+                y_reg_tr = np.concatenate([y_reg_all, y_reg_aug], axis=0)
+                y_clf_tr = np.concatenate([y_clf_all, y_clf_aug], axis=0)
+            else:
+                raise ValueError("label_mode must be 'oracle' or 'inherit'")
+
+            # --- Regression ---
             ols = LinearRegression()
-            ols.fit(W_all, y_reg_all)
+            ols.fit(W_tr, y_reg_tr)
             y_pred = ols.predict(W_unseen)
             mse = mean_squared_error(y_reg_unseen, y_pred)
             r2  = r2_score(y_reg_unseen, y_pred)
 
-            # Logistic classification
+            # --- Classification ---
             clf = LogisticRegression(max_iter=1000, random_state=seed)
-            clf.fit(W_all, y_clf_all)
+            clf.fit(W_tr, y_clf_tr)
             y_prob = clf.predict_proba(W_unseen)[:, 1]
             y_hat  = (y_prob >= 0.5).astype(int)
             auc = roc_auc_score(y_clf_unseen, y_prob)
@@ -740,6 +933,7 @@ def evaluate_lda_and_downstream(cfg: SynthConfig,
     df = pd.DataFrame(results_runs)
     downstream_metrics = df.groupby("bucket", sort=False).mean(numeric_only=True).to_dict(orient="index")
     return lda_results, downstream_metrics
+
 
 
 # ------------------------------
