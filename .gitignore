@@ -2,3 +2,7 @@ logs/*
 results/*
 __pycache__/
 *.csv
+LDS/*
+LatentKernCP/.DS_Store
+*.R
+*.ipynb
