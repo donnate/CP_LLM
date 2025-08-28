@@ -151,14 +151,14 @@ def S_path(S_cal, Phi, K, lam, alpha, best_v,
         if np.abs(S_next - S) < tol:
             if verbose:
                 print(f"[stop] step too small, S={S_next:.6g}")
-                S = S_next
+                #S = S_next
                 k += 1
             break
 
         if S_next > np.max(S_cal) + eps:
             if verbose:
                 print(f"[stop] exceeded max S_cal + eps, S={S_next:.6g}")
-                S = S_next
+                #S = S_next
                 k += 1
             break
 
