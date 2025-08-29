@@ -104,18 +104,18 @@ def S_path(S_cal, Phi, K, lam, alpha, best_v,
         cand_dir = []
 
         # (a) point in E hits a bound: v_E -> -alpha or 1-alpha
-        target = (-alpha) if start_side == 'left' else (1.0 - alpha)
+        # (a) any elbow coordinate hits either bound: v_E -> {-alpha, 1-alpha}
         vE = v[E].astype(float)
-
         for loc in range(m):
             slope = dvE_dS[loc]
-            if abs(slope) <= tol: 
+            if abs(slope) <= tol:
                 continue
-            t = (target - vE[loc]) / slope
-            if t > tol:
-                cand_steps.append(float(t))
-                cand_who.append(('leave', int(E[loc])))
-                cand_dir.append(int(np.sign(slope)))
+            for bnd, side in [(-alpha, 'L'), (1.0 - alpha, 'R')]:
+                t = (bnd - vE[loc]) / slope
+                if t > tol:
+                    cand_steps.append(float(t))
+                    cand_who.append(('leave', int(E[loc])))
+                    cand_dir.append(side)
 
         # (b) residual in L∪R becomes zero
         LR = np.concatenate((indL, indR))
@@ -123,11 +123,12 @@ def S_path(S_cal, Phi, K, lam, alpha, best_v,
             slope = dr_dS[i]
             if abs(slope) < tol:
                 continue
-            t = -r[i] / slope - S
+            t = -r[i] / slope 
             if t > tol:
                 cand_steps.append(float(t))
                 cand_who.append(('hit', int(i)))
-                cand_dir.append(int(np.sign(slope)))
+                cand_dir.append(None) 
+                #cand_dir.append(int(np.sign(slope)))
 
         if not cand_steps:
             if verbose: print("[stop] no more candidate events")
@@ -165,9 +166,9 @@ def S_path(S_cal, Phi, K, lam, alpha, best_v,
         # ----- Step 3: Update the next E, L, R -----
         if ev_kind == 'leave':
             E_new = E[E != ev_idx]
-            if ev_dir > 0:
-                indL = _as_np_unique_sorted(np.append(indL, ev_idx))
-            else:
+            if ev_dir == 'L':
+                 indL = _as_np_unique_sorted(np.append(indL, ev_idx))
+            else:  # 'R'
                 indR = _as_np_unique_sorted(np.append(indR, ev_idx))
             indE = _as_np_unique_sorted(E_new)
         else:                         
@@ -198,10 +199,24 @@ def S_path(S_cal, Phi, K, lam, alpha, best_v,
 
         # Build the stacked linear operator H z ≈ b  (least-squares)
         # H = [[PhiE, KEE], [0, PhiE^T]], b = [S_E, 0]
+        # top = np.hstack([PhiE, KEE / lam])
+        # bot = np.hstack([np.zeros((d, d)), PhiE.T])
+        # H   = np.vstack([top, bot])
+        # b   = np.concatenate([S_E, np.zeros(d)]
+        #         # Build the stacked linear operator H z ≈ b  (least-squares)
+        # H = [[PhiE, KEE/lam], [0, PhiE^T]]
+        # RHS includes L/R offsets (top) and KKT feature RHS (bottom)
+        one_L = np.ones(len(indL))
+        one_R = np.ones(len(indR))
+        dE = ((-alpha) * (K[np.ix_(E, indL)] @ one_L) +
+              (1.0 - alpha) * (K[np.ix_(E, indR)] @ one_R)) / lam
         top = np.hstack([PhiE, KEE / lam])
         bot = np.hstack([np.zeros((d, d)), PhiE.T])
         H   = np.vstack([top, bot])
-        b   = np.concatenate([S_E, np.zeros(d)])
+        b_top = S_E - dE
+        b_bot = (alpha * (Phi[indL, :].T @ one_L) -
+                 (1.0 - alpha) * (Phi[indR, :].T @ one_R)) if d > 0 else np.zeros(d)
+        b     = np.concatenate([b_top, b_bot])
 
         # QP: 0.5 z^T P z + q^T z, with P = H^T H + ridge I, q = -H^T b
         P_np = H.T @ H + ridge * np.eye(d + m)

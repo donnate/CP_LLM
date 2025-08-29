@@ -4,8 +4,8 @@ library(purrr)   # for map_dfr
 library(tidyverse)
 # list all your results files (adjust pattern and path if needed)
 files <- list.files(
-  "/Users/clairedonnat/Documents/CP_LLM/results_new/",
-  pattern = "experiment_on_alpha_.*\\.csv$",
+  "/Users/clairedonnat/Documents/CP_LLM/new_results/",
+  pattern = "new_synthetic_results_llm_cp_exp_exp_on_alpha_.*\\.csv$",
   full.names = TRUE
 )
 
@@ -40,6 +40,7 @@ colnames(summary_df)
 summary_df  =  summary_df%>%
   mutate(temp = paste0("T  = ", T),
          K_lab = paste0("K  = ", K),
+         delta_lab = paste0("delta  = ", delta),
          alpha_lab = paste0("alpha  = ", alpha),
          n_calib_docs_lab = paste0("n_calib_docs = ", n_calib_docs),
          lambda_obs_lab = paste0("lambda_obs = ", lambda_obs))
@@ -61,8 +62,56 @@ ggplot(summary_df %>% filter( epsilon ==0.5,
   geom_line(aes(x=alpha , phi_l1_aug_full_cp,color= "filtered:CP_cond")) +
   geom_point(aes(x=alpha, phi_l1_aug_full_marginal, color= "filtered:CP_marg")) +
   geom_line(aes(x=alpha, phi_l1_aug_full_marginal,color= "filtered:CP_marg")) +
-  facet_grid(K_lab  ~ temp , scales = "free" )+
+  facet_grid(delta_lab  ~ temp , scales = "free" )+
   ylab("|| A_hat - A ||_1") + 
+  scale_y_log10()+
+  #scale_x_log10()+
+  xlab("Alpha") +
+  theme_bw()
+
+
+colnames(summary_df)
+
+summary_df = 
+ggplot(summary_df %>% filter( epsilon ==0.5, 
+                              rho==2,
+                              lambda_obs == 0.05,
+                              n_calib_docs == 50)) + 
+  geom_point(aes(x=alpha, phi_l1_unaug_full, color= "Unaugmented")) +
+  geom_line(aes(x=alpha, phi_l1_unaug_full,color= "Unaugmented")) +
+  geom_point(aes(x=alpha, phi_l1_aug_full_unfiltered, color= "unfiltered")) +
+  geom_line(aes(x=alpha, phi_l1_aug_full_unfiltered,color= "unfiltered")) +
+  geom_point(aes(x=alpha, phi_l1_aug_full_obs, color= "filtered:obs")) +
+  geom_line(aes(x=alpha, phi_l1_aug_full_obs,color= "filtered:obs")) +
+  geom_point(aes(x=alpha, phi_l1_aug_full_oracle, color= "filtered:oracle")) +
+  geom_line(aes(x=alpha , phi_l1_aug_full_oracle,color= "filtered:oracle")) +
+  geom_point(aes(x=alpha, phi_l1_aug_full_cp, color= "filtered:CP_cond")) +
+  geom_line(aes(x=alpha , phi_l1_aug_full_cp,color= "filtered:CP_cond")) +
+  geom_point(aes(x=alpha, phi_l1_aug_full_marginal, color= "filtered:CP_marg")) +
+  geom_line(aes(x=alpha, phi_l1_aug_full_marginal,color= "filtered:CP_marg")) +
+  facet_grid(delta_lab  ~ temp , scales = "free" )+
+  ylab("|| A_hat - A ||_1") + 
+  scale_y_log10()+
+  #scale_x_log10()+
+  xlab("Alpha") +
+  theme_bw()
+
+
+
+colnames(summary_df %>% select(starts_with("reg_mse_")))
+ggplot(results_df %>% filter( epsilon ==0.5, 
+                              rho==2,
+                              T ==2,
+                              #lambda_obs == 0.05,
+                              n_calib_docs == 50)) + 
+  geom_boxplot(aes(x="Unaugmented", reg_mse_unaug_full, color= "Unaugmented")) +
+  geom_boxplot(aes(x= "unfiltered", reg_mse_aug_full_unfiltered, color= "unfiltered")) +
+  geom_boxplot(aes(x="filtered:obs", reg_mse_aug_full_obs, color= "filtered:obs")) +
+  geom_boxplot(aes(x="filtered:oracle", reg_mse_aug_full_oracle, color= "filtered:oracle")) +
+  geom_boxplot(aes(x= "filtered:CP_cond", reg_mse_aug_full_cp, color= "filtered:CP_cond")) +
+  geom_boxplot(aes(x="filtered:CP_marg", reg_mse_aug_full_marginal, color= "filtered:CP_marg")) +
+  facet_grid(alpha  ~ lambda_obs, scales = "free" )+
+  ylab("Reg MSE") + 
   scale_y_log10()+
   #scale_x_log10()+
   xlab("Alpha") +
@@ -265,6 +314,86 @@ ggplot(summary_df %>% filter( epsilon ==0.5,
   scale_x_log10()+
   xlab("Number Augmentations") +
   theme_bw()
+
+
+colnames(summary_df)
+find_max = summary_df %>%
+  select(V, K, delta,alpha, epsilon, T, rho, alpha_cp,
+         n_train_docs, n_calib_docs,
+         lambda_obs, phi_l1_unaug_full,
+         phi_l1_aug_full_unfiltered,
+         phi_l1_aug_full_obs,
+         phi_l1_aug_full_oracle,
+         phi_l1_aug_full_cp, phi_l1_aug_full_marginal,
+         starts_with("n_added")) %>%
+  pivot_longer(cols=-c(V, K, delta,alpha, epsilon, T, rho, alpha_cp,
+                       n_train_docs, n_calib_docs,
+                       lambda_obs,
+                       starts_with("n_added"))) %>%
+  group_by(V, K, delta,alpha, epsilon, T, rho, alpha_cp,
+           n_train_docs, n_calib_docs,name) %>%
+  slice_min(value)
+find_max["method"] =sapply(find_max$name,
+                           function(x){
+                             if(x == "phi_l1_aug_full_cp"){
+                                 return("condCP")
+                             }
+                             if(x == "phi_l1_aug_full_marginal"){
+                               return("margCP")
+                             }
+                             if(x == "phi_l1_aug_full_obs"){
+                               return("filtered:obs")
+                             }
+                             if(x == "phi_l1_aug_full_oracle"){
+                               return("filtered:oracle")
+                             }
+                             if(x == "phi_l1_aug_full_unfiltered"){
+                               return("unfiltered")
+                             }
+                             if(x == "phi_l1_unaug_full"){
+                               return("unaugmented")
+                             }
+                             })
+library(dplyr)
+
+find_max <- find_max %>%
+  mutate(
+    n_added = case_when(
+      name == "phi_l1_aug_full_cp"        ~ n_added_aug_full_cp,
+      name == "phi_l1_aug_full_marginal"  ~ n_added_aug_full_marginal,
+      name == "phi_l1_aug_full_obs"       ~ n_added_aug_full_obs,
+      name == "phi_l1_aug_full_oracle"    ~ n_added_aug_full_oracle,
+      name == "phi_l1_aug_full_unfiltered"~ n_added_aug_full_unfiltered,
+      name == "phi_l1_unaug_full"         ~ n_added_unaug_full
+    )
+  )
+
+
+find_max  =  find_max%>%
+  mutate(temp = paste0("T  = ", T),
+         K_lab = paste0("K  = ", K),
+         alpha_lab = paste0("alpha  = ", alpha),
+         n_calib_docs_lab = paste0("n_calib_docs = ", n_calib_docs),
+         lambda_obs_lab = paste0("lambda_obs = ", lambda_obs))
+unique(find_max$K)
+
+
+ggplot(find_max %>% filter( epsilon ==0.5, 
+                            alpha>0.1,
+                            name!="phi_l1_unaug_full",
+                            rho==2)) + 
+  geom_point(aes(x=alpha, value, color= name, 
+                 size=log(1+n_added))) +
+  geom_line(aes(x=alpha, value,color= name)) +
+  facet_grid(K_lab  ~ . , scales = "free" )+
+  ylab("|| A_hat - A ||_1") + 
+  scale_y_log10()+
+  #scale_x_log10()+
+  xlab("alpha") +
+  theme_bw()
+
+
+
 
 
 
